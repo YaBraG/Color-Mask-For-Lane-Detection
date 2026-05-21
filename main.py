@@ -9,6 +9,7 @@ import numpy as np
 
 from config import (
     CENTERLINE_ALPHA,
+    CENTERLINE_SMOOTHING_ALPHA,
     CENTER_DEADBAND_PX,
     CENTER_STRONG_PX,
     CONFIDENCE_ALPHA,
@@ -19,6 +20,8 @@ from config import (
     FRAME_HEIGHT,
     FRAME_WIDTH,
     LAST_CENTER_HOLD_FRAMES,
+    MAX_CENTER_JUMP_PX,
+    MIN_SEGMENT_WIDTH_PX,
     REALSENSE_FPS,
     REALSENSE_HEIGHT,
     REALSENSE_WIDTH,
@@ -42,6 +45,8 @@ class RoadResult:
     curve_error_px: float | None
     near_center_x: int | None
     far_center_x: int | None
+    tracked_center_valid: bool
+    rejected_scanlines: int
     scan_points: list[tuple[int, int, int, int]]
     boundary_points: list[tuple[int, int]]
 
@@ -332,9 +337,10 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
     area = int(cv2.countNonZero(mask))
     roi_area = max(1, width * (height - roi_top))
     min_area = roi_area * settings["Min_area_percent"] / 100.0
-    scan_points, boundary_points = estimate_scanline_centers(mask, roi_top)
+    scan_points, boundary_points, rejected_scanlines = estimate_scanline_centers(mask, roi_top)
+    tracked_center_valid = len(scan_points) >= 2
 
-    road_detected = area > 0 and area >= min_area and len(scan_points) > 0
+    road_detected = area > 0 and area >= min_area and tracked_center_valid
     road_confidence = min(1.0, area / max(1.0, min_area * 3.0)) if road_detected else 0.0
 
 
@@ -345,7 +351,7 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
     far_center_x = None
     if road_detected and scan_points:
         # Weight lower scanlines more because they are closer to the vehicle and more reliable.
-        weights = np.linspace(1.0, 2.0, num=len(scan_points))
+        weights = np.linspace(2.0, 1.0, num=len(scan_points))
         centers = np.array([point[0] for point in scan_points], dtype=np.float32)
         road_center_x = float(np.average(centers, weights=weights))
 
@@ -373,6 +379,8 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
         curve_error_px=curve_error_px,
         near_center_x=near_center_x,
         far_center_x=far_center_x,
+        tracked_center_valid=tracked_center_valid,
+        rejected_scanlines=rejected_scanlines,
         scan_points=scan_points,
         boundary_points=boundary_points,
     )
@@ -421,24 +429,89 @@ def keep_relevant_component(mask, settings):
 
 
 def estimate_scanline_centers(mask, roi_top):
-    height, _width = mask.shape[:2]
+    height, width = mask.shape[:2]
     y_values = np.linspace(height - 35, max(roi_top + 10, int(height * 0.52)), SCANLINE_COUNT).astype(int)
 
-    scan_points = []
+    raw_points = []
     boundary_points = []
+    rejected_scanlines = 0
+    previous_center_x = width / 2.0
+
     for y in y_values:
-        xs = np.where(mask[y, :] > 0)[0]
-        if xs.size < 8:
+        segments = find_road_segments(mask[y, :], MIN_SEGMENT_WIDTH_PX)
+        if not segments:
+            rejected_scanlines += 1
             continue
-        left_x = int(xs[0])
-        right_x = int(xs[-1])
-        center_x = int((left_x + right_x) / 2)
-        scan_points.append((center_x, left_x, right_x, int(y)))
+
+        # Using the full row's leftmost and rightmost white pixel fails at
+        # curves/intersections because it averages across every visible road
+        # branch. Instead, each white run is a candidate corridor, and we keep
+        # the run whose center is closest to the previous tracked center.
+        best_segment = min(segments, key=lambda segment: abs(segment[2] - previous_center_x))
+        left_x, right_x, center_x = best_segment
+        center_jump = center_x - previous_center_x
+
+        # Reject large jumps so the path does not snap across a wide
+        # intersection to a different road branch in one scanline.
+        if abs(center_jump) > MAX_CENTER_JUMP_PX:
+            rejected_scanlines += 1
+            continue
+
+        raw_points.append((float(center_x), int(left_x), int(right_x), int(y)))
         boundary_points.append((left_x, int(y)))
         boundary_points.append((right_x, int(y)))
+        previous_center_x = center_x
+
+    scan_points = smooth_centerline_points(raw_points)
 
     # Preserve bottom-to-top order for drawing a path from the vehicle forward.
-    return scan_points, boundary_points
+    return scan_points, boundary_points, rejected_scanlines
+
+
+def find_road_segments(row_mask, min_width_px):
+    segments = []
+    in_segment = False
+    start_x = 0
+
+    for x, value in enumerate(row_mask):
+        if value > 0 and not in_segment:
+            start_x = x
+            in_segment = True
+        elif value == 0 and in_segment:
+            add_segment_if_wide_enough(segments, start_x, x - 1, min_width_px)
+            in_segment = False
+
+    if in_segment:
+        add_segment_if_wide_enough(segments, start_x, len(row_mask) - 1, min_width_px)
+
+    return segments
+
+
+def add_segment_if_wide_enough(segments, left_x, right_x, min_width_px):
+    width = right_x - left_x + 1
+    if width < min_width_px:
+        return
+    center_x = (left_x + right_x) / 2.0
+    segments.append((int(left_x), int(right_x), float(center_x)))
+
+
+def smooth_centerline_points(raw_points):
+    if not raw_points:
+        return []
+
+    smoothed_points = []
+    smoothed_center_x = raw_points[0][0]
+
+    for center_x, left_x, right_x, y in raw_points:
+        # Exponential smoothing keeps the centerline from twitching when mask
+        # edges are noisy, while still allowing gradual curves to show up.
+        smoothed_center_x = (
+            (1.0 - CENTERLINE_SMOOTHING_ALPHA) * smoothed_center_x
+            + CENTERLINE_SMOOTHING_ALPHA * center_x
+        )
+        smoothed_points.append((int(round(smoothed_center_x)), left_x, right_x, y))
+
+    return smoothed_points
 
 
 def make_candidates(width, height):
@@ -556,6 +629,8 @@ def draw_debug_text(output, result, confidences, selected_path, smoothed_curve_e
         f"turn_hint: {turn_hint}",
         f"near_center_x: {near_text}",
         f"far_center_x: {far_text}",
+        f"tracked_center_valid: {result.tracked_center_valid}",
+        f"rejected_scanlines: {result.rejected_scanlines}",
         f"selected_path: {selected_path}",
         f"straight_confidence: {confidences['straight']:.2f}",
         f"left_confidence: {confidences['left']:.2f}",

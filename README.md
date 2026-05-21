@@ -85,6 +85,9 @@ The main window shows:
 - Optional demo candidate path visualization
 - Debug values for road detection, center error, selected path, and path confidences
 - Curve debug values: `curve_error_px`, `turn_hint`, `near_center_x`, and `far_center_x`
+- Tracking debug values: `tracked_center_valid` and `rejected_scanlines`
+
+The center path is tracked from the bottom-center of the image upward. Each scanline is split into continuous road segments, and the segment closest to the previous center is selected. This avoids averaging across the full road width at forks and intersections.
 
 ## Known Limitations
 
