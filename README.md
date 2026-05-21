@@ -58,10 +58,10 @@ py -3.12 main.py --source realsense
 3. Adjust the HSV trackbars until the road is white in the mask and the sidewalk/background is black.
 4. Adjust `ROI_top_percent` if the upper image contains distracting walls, signs, windows, or traffic lights.
 5. Adjust `Morph_kernel` to remove noise.
-6. Adjust `Close_kernel` to fill small black holes inside the road mask.
+6. Adjust `Close_kernel` to fill small black holes inside the road mask. `Close_kernel = 0` disables close morphology.
 7. Press `s` to save settings.
 
-Default dark-road settings:
+Default dark-road settings from live QCar2 RealSense camera testing:
 
 - `H_min = 0`
 - `H_max = 179`
@@ -69,10 +69,20 @@ Default dark-road settings:
 - `S_max = 80`
 - `V_min = 20`
 - `V_max = 120`
-- `ROI_top_percent = 35`
+- `ROI_top_percent = 58`
 - `Morph_kernel = 5`
-- `Close_kernel = 11`
+- `Close_kernel = 0`
 - `Min_area_percent = 3`
+
+## Development Log Rule
+
+Every time Codex modifies this repository, it must update `CHANGELOG.md` with:
+
+- Date
+- Files changed
+- Summary of what changed
+- Why the change was made
+- Any known issues or follow-up work
 
 ## Display
 

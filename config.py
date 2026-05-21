@@ -24,9 +24,9 @@ DEFAULT_SETTINGS = {
     "S_max": 80,
     "V_min": 20,
     "V_max": 120,
-    "ROI_top_percent": 35,
+    "ROI_top_percent": 58,
     "Morph_kernel": 5,
-    "Close_kernel": 11,
+    "Close_kernel": 0,
     "Min_area_percent": 3,
 }
 

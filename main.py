@@ -273,12 +273,17 @@ def get_trackbar_settings():
     if settings["V_min"] > settings["V_max"]:
         settings["V_min"], settings["V_max"] = settings["V_max"], settings["V_min"]
 
-    # OpenCV morphology needs positive odd kernel sizes.
-    for kernel_name in ("Morph_kernel", "Close_kernel"):
-        kernel = max(1, settings[kernel_name])
-        if kernel % 2 == 0:
-            kernel += 1
-        settings[kernel_name] = kernel
+    # OpenCV morphology kernels must be odd. Morph_kernel is always active,
+    # while Close_kernel may be 0 to skip closing completely.
+    morph_kernel = max(1, settings["Morph_kernel"])
+    if morph_kernel % 2 == 0:
+        morph_kernel += 1
+    settings["Morph_kernel"] = morph_kernel
+
+    close_kernel = max(0, settings["Close_kernel"])
+    if close_kernel > 0 and close_kernel % 2 == 0:
+        close_kernel += 1
+    settings["Close_kernel"] = close_kernel
     settings["ROI_top_percent"] = min(max(settings["ROI_top_percent"], 0), 80)
     settings["Min_area_percent"] = min(max(settings["Min_area_percent"], 0), 30)
     return settings
@@ -327,11 +332,12 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_OPEN, kernel)
 
-    # Closing fills small black holes inside the road mask. A separate, larger
-    # close kernel is useful when the road threshold is good but has pinholes.
+    # Closing fills small black holes inside the road mask. Set Close_kernel to
+    # 0 to skip this step when closing over-fills the tuned live road shape.
     close_kernel_size = settings["Close_kernel"]
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel_size, close_kernel_size))
-    full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_CLOSE, close_kernel)
+    if close_kernel_size > 0:
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel_size, close_kernel_size))
+        full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_CLOSE, close_kernel)
 
     mask = keep_relevant_component(full_mask, settings)
     area = int(cv2.countNonZero(mask))
