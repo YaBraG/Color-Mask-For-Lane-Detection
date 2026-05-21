@@ -26,6 +26,7 @@ DEFAULT_SETTINGS = {
     "V_max": 120,
     "ROI_top_percent": 35,
     "Morph_kernel": 5,
+    "Close_kernel": 11,
     "Min_area_percent": 3,
 }
 
@@ -38,13 +39,17 @@ TRACKBAR_RANGES = {
     "V_max": 255,
     "ROI_top_percent": 80,
     "Morph_kernel": 31,
+    "Close_kernel": 51,
     "Min_area_percent": 30,
 }
 
 SCANLINE_COUNT = 12
 LAST_CENTER_HOLD_FRAMES = 12
 CONFIDENCE_ALPHA = 0.18
+CENTERLINE_ALPHA = 0.25
 CENTER_DEADBAND_PX = 35
 CENTER_STRONG_PX = 110
+CURVE_DEADBAND_PX = 45
+CURVE_STRONG_PX = 140
 SELECT_CONFIDENCE = 0.80
 SELECT_MARGIN = 0.25

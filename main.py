@@ -8,10 +8,13 @@ import cv2
 import numpy as np
 
 from config import (
+    CENTERLINE_ALPHA,
     CENTER_DEADBAND_PX,
     CENTER_STRONG_PX,
     CONFIDENCE_ALPHA,
     CONFIG_FILE,
+    CURVE_DEADBAND_PX,
+    CURVE_STRONG_PX,
     DEFAULT_SETTINGS,
     FRAME_HEIGHT,
     FRAME_WIDTH,
@@ -36,6 +39,9 @@ class RoadResult:
     road_confidence: float
     road_center_x: float | None
     road_center_error_px: float | None
+    curve_error_px: float | None
+    near_center_x: int | None
+    far_center_x: int | None
     scan_points: list[tuple[int, int, int, int]]
     boundary_points: list[tuple[int, int]]
 
@@ -117,34 +123,52 @@ class RealSenseSource(ImageSource):
 class PathConfidenceTracker:
     def __init__(self):
         self.confidences = {"left": 0.33, "straight": 0.34, "right": 0.33}
+        self.smoothed_curve_error_px = None
 
-    def update(self, center_error_px: float | None, road_detected: bool):
+    def update(self, center_error_px: float | None, curve_error_px: float | None, road_detected: bool):
         target = {"left": 0.33, "straight": 0.34, "right": 0.33}
 
-        if road_detected and center_error_px is not None:
-            error = float(center_error_px)
-            abs_error = abs(error)
+        if road_detected and curve_error_px is not None:
+            curve = float(curve_error_px)
+            if self.smoothed_curve_error_px is None:
+                self.smoothed_curve_error_px = curve
+            else:
+                self.smoothed_curve_error_px = (
+                    (1.0 - CENTERLINE_ALPHA) * self.smoothed_curve_error_px
+                    + CENTERLINE_ALPHA * curve
+                )
+        elif not road_detected:
+            self.smoothed_curve_error_px = None
 
-            if abs_error <= CENTER_DEADBAND_PX:
-                target = {"left": 0.12, "straight": 0.76, "right": 0.12}
-            elif error < -CENTER_STRONG_PX:
-                target = {"left": 0.78, "straight": 0.12, "right": 0.10}
-            elif error > CENTER_STRONG_PX:
-                target = {"left": 0.10, "straight": 0.12, "right": 0.78}
-            elif error < 0:
-                amount = min(1.0, (abs_error - CENTER_DEADBAND_PX) / max(1, CENTER_STRONG_PX - CENTER_DEADBAND_PX))
+        if road_detected and self.smoothed_curve_error_px is not None:
+            curve = self.smoothed_curve_error_px
+            abs_curve = abs(curve)
+
+            # curve_error_px is the far road center minus the near road center.
+            # Negative means the visible road bends left; positive means it bends right.
+            if abs_curve <= CURVE_DEADBAND_PX:
+                target = {"left": 0.07, "straight": 0.86, "right": 0.07}
+            elif curve < -CURVE_STRONG_PX:
+                target = {"left": 0.86, "straight": 0.08, "right": 0.06}
+            elif curve > CURVE_STRONG_PX:
+                target = {"left": 0.06, "straight": 0.08, "right": 0.86}
+            elif curve < 0:
+                amount = min(1.0, (abs_curve - CURVE_DEADBAND_PX) / max(1, CURVE_STRONG_PX - CURVE_DEADBAND_PX))
                 target = {
-                    "left": 0.35 + 0.35 * amount,
-                    "straight": 0.50 - 0.25 * amount,
-                    "right": 0.15 - 0.10 * amount,
+                    "left": 0.38 + 0.36 * amount,
+                    "straight": 0.48 - 0.26 * amount,
+                    "right": 0.14 - 0.10 * amount,
                 }
             else:
-                amount = min(1.0, (abs_error - CENTER_DEADBAND_PX) / max(1, CENTER_STRONG_PX - CENTER_DEADBAND_PX))
+                amount = min(1.0, (abs_curve - CURVE_DEADBAND_PX) / max(1, CURVE_STRONG_PX - CURVE_DEADBAND_PX))
                 target = {
-                    "left": 0.15 - 0.10 * amount,
-                    "straight": 0.50 - 0.25 * amount,
-                    "right": 0.35 + 0.35 * amount,
+                    "left": 0.14 - 0.10 * amount,
+                    "straight": 0.48 - 0.26 * amount,
+                    "right": 0.38 + 0.36 * amount,
                 }
+
+            if center_error_px is not None:
+                target = self.apply_lateral_correction(target, center_error_px)
 
         for name in self.confidences:
             old_value = self.confidences[name]
@@ -155,7 +179,32 @@ class PathConfidenceTracker:
             for name in self.confidences:
                 self.confidences[name] /= total
 
-        return self.confidences.copy(), self.selected_path()
+        return self.confidences.copy(), self.selected_path(), self.smoothed_curve_error_px, self.turn_hint()
+
+    def apply_lateral_correction(self, target, center_error_px):
+        # road_center_error_px is the detected road center minus the image center.
+        # Negative means the drivable corridor is left of the camera; positive means right.
+        correction = min(0.12, abs(center_error_px) / max(1, CENTER_STRONG_PX) * 0.12)
+        if abs(center_error_px) <= CENTER_DEADBAND_PX:
+            return target
+        if center_error_px < 0:
+            target["left"] += correction
+            target["right"] = max(0.02, target["right"] - correction)
+        else:
+            target["right"] += correction
+            target["left"] = max(0.02, target["left"] - correction)
+
+        total = sum(target.values())
+        return {name: value / total for name, value in target.items()}
+
+    def turn_hint(self):
+        if self.smoothed_curve_error_px is None:
+            return "unknown"
+        if self.smoothed_curve_error_px < -CURVE_DEADBAND_PX:
+            return "left"
+        if self.smoothed_curve_error_px > CURVE_DEADBAND_PX:
+            return "right"
+        return "straight"
 
     def selected_path(self):
         ordered = sorted(self.confidences.items(), key=lambda item: item[1], reverse=True)
@@ -178,7 +227,7 @@ def print_startup(args):
     print("QCar2 RGB Road Detector")
     print("-----------------------")
     print(f"Source: {args.source}")
-    print("Keys: q/ESC quit | s save HSV | l load HSV | r reset HSV | m toggle mask window | p pause")
+    print("Keys: q/ESC quit | s save HSV | l load HSV | r reset HSV | m mask | p pause | c candidates")
     print("Tune HSV until road is white in the mask and non-road is black.")
     print()
 
@@ -219,11 +268,12 @@ def get_trackbar_settings():
     if settings["V_min"] > settings["V_max"]:
         settings["V_min"], settings["V_max"] = settings["V_max"], settings["V_min"]
 
-    # OpenCV morphology needs a positive odd kernel size.
-    kernel = max(1, settings["Morph_kernel"])
-    if kernel % 2 == 0:
-        kernel += 1
-    settings["Morph_kernel"] = kernel
+    # OpenCV morphology needs positive odd kernel sizes.
+    for kernel_name in ("Morph_kernel", "Close_kernel"):
+        kernel = max(1, settings[kernel_name])
+        if kernel % 2 == 0:
+            kernel += 1
+        settings[kernel_name] = kernel
     settings["ROI_top_percent"] = min(max(settings["ROI_top_percent"], 0), 80)
     settings["Min_area_percent"] = min(max(settings["Min_area_percent"], 0), 30)
     return settings
@@ -271,7 +321,12 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
     kernel_size = settings["Morph_kernel"]
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_OPEN, kernel)
-    full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_CLOSE, kernel)
+
+    # Closing fills small black holes inside the road mask. A separate, larger
+    # close kernel is useful when the road threshold is good but has pinholes.
+    close_kernel_size = settings["Close_kernel"]
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel_size, close_kernel_size))
+    full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_CLOSE, close_kernel)
 
     mask = keep_relevant_component(full_mask, settings)
     area = int(cv2.countNonZero(mask))
@@ -285,12 +340,26 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
 
     road_center_x = None
     road_center_error_px = None
+    curve_error_px = None
+    near_center_x = None
+    far_center_x = None
     if road_detected and scan_points:
         # Weight lower scanlines more because they are closer to the vehicle and more reliable.
         weights = np.linspace(1.0, 2.0, num=len(scan_points))
         centers = np.array([point[0] for point in scan_points], dtype=np.float32)
         road_center_x = float(np.average(centers, weights=weights))
+
+        # road_center_error_px is lateral error: road center minus camera/image center.
+        # Negative means the road is left of the camera; positive means it is right.
         road_center_error_px = road_center_x - (width / 2.0)
+
+        near_center_x = scan_points[0][0]
+        far_center_x = scan_points[-1][0]
+        if len(scan_points) >= 2:
+            # curve_error_px compares far road center to near road center.
+            # Negative means the road center moves left as it goes forward.
+            # Positive means it moves right; near zero means mostly straight.
+            curve_error_px = float(far_center_x - near_center_x)
     elif last_center_x is not None and frames_since_valid <= LAST_CENTER_HOLD_FRAMES:
         road_center_x = last_center_x
         road_center_error_px = road_center_x - (width / 2.0)
@@ -301,6 +370,9 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
         road_confidence=road_confidence,
         road_center_x=road_center_x,
         road_center_error_px=road_center_error_px,
+        curve_error_px=curve_error_px,
+        near_center_x=near_center_x,
+        far_center_x=far_center_x,
         scan_points=scan_points,
         boundary_points=boundary_points,
     )
@@ -402,7 +474,7 @@ def make_candidates(width, height):
     }
 
 
-def draw_visualization(frame, result, confidences, selected_path):
+def draw_visualization(frame, result, confidences, selected_path, smoothed_curve_error_px, turn_hint, show_candidates):
     output = frame.copy()
     height, width = output.shape[:2]
 
@@ -413,41 +485,77 @@ def draw_visualization(frame, result, confidences, selected_path):
     for left_x, y in result.boundary_points:
         cv2.circle(output, (left_x, y), 4, (0, 255, 255), -1)
 
-    if result.scan_points:
-        centerline_points = [(int(center_x), int(y)) for center_x, _left_x, _right_x, y in result.scan_points]
-        if len(centerline_points) >= 2:
-            cv2.polylines(output, [np.array(centerline_points, dtype=np.int32)], False, (0, 255, 0), 3)
+    if show_candidates:
+        draw_candidate_paths(output, confidences, selected_path)
 
+    draw_detected_centerline(output, result)
+    cv2.line(output, (width // 2, height), (width // 2, int(height * 0.45)), (255, 255, 255), 1)
+
+    draw_debug_text(output, result, confidences, selected_path, smoothed_curve_error_px, turn_hint)
+    return output
+
+
+def draw_candidate_paths(output, confidences, selected_path):
+    height, width = output.shape[:2]
     candidates = make_candidates(width, height)
     for name, points in candidates.items():
         confidence = confidences[name]
         if name == selected_path:
-            color = (0, 255, 255)
-            thickness = 6
-        else:
-            brightness = int(80 + 130 * confidence)
-            color = (brightness, brightness, 255)
+            color = (80, 220, 255)
             thickness = 3
+        else:
+            brightness = int(45 + 80 * confidence)
+            color = (brightness, brightness, 150)
+            thickness = 2
         cv2.polylines(output, [points], False, color, thickness, cv2.LINE_AA)
-        cv2.circle(output, tuple(points[-1]), 6, color, -1)
-
-    if result.road_center_x is not None:
-        start = (width // 2, height - 1)
-        end = (int(result.road_center_x), int(height * 0.58))
-        cv2.arrowedLine(output, start, end, (255, 255, 0), 4, cv2.LINE_AA, tipLength=0.12)
-        cv2.line(output, (width // 2, height), (width // 2, int(height * 0.45)), (255, 255, 255), 1)
-
-    draw_debug_text(output, result, confidences, selected_path)
-    return output
+        cv2.circle(output, tuple(points[-1]), 4, color, -1)
 
 
-def draw_debug_text(output, result, confidences, selected_path):
+def draw_detected_centerline(output, result):
+    if not result.scan_points:
+        return
+
+    height, width = output.shape[:2]
+    centerline_points = [(int(center_x), int(y)) for center_x, _left_x, _right_x, y in result.scan_points]
+    path_points = [(width // 2, height - 8)] + centerline_points
+
+    if len(path_points) >= 2:
+        path_array = np.array(path_points, dtype=np.int32)
+        # Draw a dark outline first so the real detected path stays readable
+        # over both the camera image and the semi-transparent road overlay.
+        cv2.polylines(output, [path_array], False, (0, 70, 70), 9, cv2.LINE_AA)
+        cv2.polylines(output, [path_array], False, (0, 255, 220), 5, cv2.LINE_AA)
+
+        # Put the arrow head on the final segment so it follows the scanline
+        # center path instead of pointing to a single averaged center.
+        cv2.arrowedLine(
+            output,
+            tuple(path_array[-2]),
+            tuple(path_array[-1]),
+            (0, 255, 220),
+            5,
+            cv2.LINE_AA,
+            tipLength=0.35,
+        )
+
+    for x, y in centerline_points:
+        cv2.circle(output, (x, y), 5, (0, 255, 0), -1)
+
+
+def draw_debug_text(output, result, confidences, selected_path, smoothed_curve_error_px, turn_hint):
     error = result.road_center_error_px
     error_text = "None" if error is None else f"{error:.1f}"
+    curve_text = "None" if smoothed_curve_error_px is None else f"{smoothed_curve_error_px:.1f}"
+    near_text = "None" if result.near_center_x is None else str(result.near_center_x)
+    far_text = "None" if result.far_center_x is None else str(result.far_center_x)
     lines = [
         f"road_detected: {result.road_detected}",
         f"road_confidence: {result.road_confidence:.2f}",
         f"road_center_error_px: {error_text}",
+        f"curve_error_px: {curve_text}",
+        f"turn_hint: {turn_hint}",
+        f"near_center_x: {near_text}",
+        f"far_center_x: {far_text}",
         f"selected_path: {selected_path}",
         f"straight_confidence: {confidences['straight']:.2f}",
         f"left_confidence: {confidences['left']:.2f}",
@@ -457,7 +565,7 @@ def draw_debug_text(output, result, confidences, selected_path):
     x = 12
     y = 28
     line_height = 26
-    panel_width = 330
+    panel_width = 360
     panel_height = line_height * len(lines) + 12
     overlay = output.copy()
     cv2.rectangle(overlay, (5, 5), (panel_width, panel_height), (0, 0, 0), -1)
@@ -482,7 +590,7 @@ def build_display_grid(original, result, visualization):
         )
 
     top = np.hstack([label_image(original, "Original RGB"), label_image(mask_bgr, "Road Mask")])
-    bottom = np.hstack([label_image(road_overlay, "Road Overlay"), label_image(visualization, "Path Candidates")])
+    bottom = np.hstack([label_image(road_overlay, "Road Overlay"), label_image(visualization, "Detected Center Path")])
     grid = np.vstack([top, bottom])
     return cv2.resize(grid, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
 
@@ -510,6 +618,8 @@ def handle_key(key, settings):
         return "toggle_mask"
     elif key == ord("p"):
         return "toggle_pause"
+    elif key == ord("c"):
+        return "toggle_candidates"
     return None
 
 
@@ -528,6 +638,7 @@ def main():
 
     tracker = PathConfidenceTracker()
     show_mask_window = False
+    show_candidates = True
     paused = False
     last_frame = None
     last_center_x = None
@@ -552,8 +663,20 @@ def main():
             else:
                 frames_since_valid += 1
 
-            confidences, selected_path = tracker.update(result.road_center_error_px, result.road_detected)
-            visualization = draw_visualization(frame, result, confidences, selected_path)
+            confidences, selected_path, smoothed_curve_error_px, turn_hint = tracker.update(
+                result.road_center_error_px,
+                result.curve_error_px,
+                result.road_detected,
+            )
+            visualization = draw_visualization(
+                frame,
+                result,
+                confidences,
+                selected_path,
+                smoothed_curve_error_px,
+                turn_hint,
+                show_candidates,
+            )
             display = build_display_grid(frame, result, visualization)
             cv2.imshow(WINDOW_MAIN, display)
 
@@ -574,6 +697,9 @@ def main():
             elif action == "toggle_pause":
                 paused = not paused
                 print("Paused." if paused else "Unpaused.")
+            elif action == "toggle_candidates":
+                show_candidates = not show_candidates
+                print("Candidate paths on." if show_candidates else "Candidate paths off.")
     finally:
         source.release()
         cv2.destroyAllWindows()

@@ -49,6 +49,7 @@ py -3.12 main.py --source realsense
 - `r`: reset HSV settings to defaults
 - `m`: toggle separate mask debug window
 - `p`: pause/unpause frame processing
+- `c`: toggle demo candidate paths on/off
 
 ## Tuning
 
@@ -56,8 +57,9 @@ py -3.12 main.py --source realsense
 2. Run image, webcam, or RealSense mode.
 3. Adjust the HSV trackbars until the road is white in the mask and the sidewalk/background is black.
 4. Adjust `ROI_top_percent` if the upper image contains distracting walls, signs, windows, or traffic lights.
-5. Adjust `Morph_kernel` to remove noise and fill small gaps.
-6. Press `s` to save settings.
+5. Adjust `Morph_kernel` to remove noise.
+6. Adjust `Close_kernel` to fill small black holes inside the road mask.
+7. Press `s` to save settings.
 
 Default dark-road settings:
 
@@ -69,6 +71,7 @@ Default dark-road settings:
 - `V_max = 120`
 - `ROI_top_percent = 35`
 - `Morph_kernel = 5`
+- `Close_kernel = 11`
 - `Min_area_percent = 3`
 
 ## Display
@@ -78,14 +81,15 @@ The main window shows:
 - Original RGB frame
 - Road mask
 - Road overlay
-- Suggested drivable center path
-- Candidate path visualization
+- Detected drivable center path from road-mask scanlines
+- Optional demo candidate path visualization
 - Debug values for road detection, center error, selected path, and path confidences
+- Curve debug values: `curve_error_px`, `turn_hint`, `near_center_x`, and `far_center_x`
 
 ## Known Limitations
 
 - This is not ML and does not understand objects semantically.
 - It depends on color and brightness contrast between road and non-road.
 - Lighting changes may require HSV tuning.
-- Candidate paths are demo paths only until connected to real map, planner, or vehicle behavior data.
+- Candidate paths are demo paths only; the bright detected centerline is the main visual output.
 - It uses RGB only and ignores RealSense depth.
