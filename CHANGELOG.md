@@ -4,6 +4,32 @@
 
 Files changed:
 
+- `config.py`
+- `main.py`
+- `README.md`
+- `CHANGELOG.md`
+
+Summary:
+
+- Added video config controls with `--use-default-config`, `--config`, terminal config-source output, and `config_source` in `test_video_config_used.json`.
+- Fixed video confidence scoring so `road_confidence` and `detection_quality` combine mask area, valid scanlines, and rejected scanlines instead of depending only on `Min_area_percent`.
+- Fixed first centerline anchor behavior so the tracker can lock onto the first visible road segment away from image center before applying `MAX_CENTER_JUMP_PX` to later scanlines.
+- Added `ALLOW_FIRST_ANCHOR_JUMP = True` and telemetry for `valid_scanline_count`, `seed_center_x`, `first_anchor_x`, and `first_anchor_distance_px`.
+- Added timestamped per-run output folders under `outputs/test_video_YYYYMMDD_HHMMSS/`, plus `outputs/latest_run.txt`, reducing stale output and mixed-run risk.
+- Improved failure-frame selection to keep one prioritized reason per frame and improved events CSV to record low-confidence and rejected-scanline intervals instead of repeated rows.
+
+Why:
+
+- The first offline AI review showed that saved `road_config.json` values were silently overriding intended defaults, confidence collapsed into unhelpful 0/1 behavior, centerline tracking rejected visible curved-road anchors, and old output files could be mixed into new analysis uploads.
+
+Known issues or follow-up:
+
+- Add automated tests for config-source selection, timestamped output creation, and event interval logging once a small synthetic video fixture is available.
+
+## 2026-05-22
+
+Files changed:
+
 - `main.py`
 - `README.md`
 - `.gitignore`

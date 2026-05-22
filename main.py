@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import sys
 import time
 from collections import Counter
@@ -13,6 +14,7 @@ import cv2
 import numpy as np
 
 from config import (
+    ALLOW_FIRST_ANCHOR_JUMP,
     CENTERLINE_ALPHA,
     CENTERLINE_SMOOTHING_ALPHA,
     CENTER_DEADBAND_PX,
@@ -52,6 +54,11 @@ class RoadResult:
     far_center_x: int | None
     tracked_center_valid: bool
     rejected_scanlines: int
+    valid_scanline_count: int
+    detection_quality: float
+    seed_center_x: float
+    first_anchor_x: float | None
+    first_anchor_distance_px: float | None
     scan_points: list[tuple[int, int, int, int]]
     boundary_points: list[tuple[int, int]]
 
@@ -234,6 +241,21 @@ def parse_args():
     parser.add_argument("--output-dir", default="outputs", help="Folder where video-mode outputs are written.")
     parser.add_argument("--no-display", action="store_true", help="Process video without opening OpenCV windows.")
     parser.add_argument(
+        "--use-default-config",
+        action="store_true",
+        help="Use DEFAULT_SETTINGS from config.py for video mode and ignore road_config.json.",
+    )
+    parser.add_argument(
+        "--config",
+        default=CONFIG_FILE,
+        help="Config JSON to load for video mode. Defaults to road_config.json when it exists.",
+    )
+    parser.add_argument(
+        "--clean-output",
+        action="store_true",
+        help="Delete only the new timestamped run folder before writing if it already exists.",
+    )
+    parser.add_argument(
         "--save-failure-frames",
         action="store_true",
         help="Save debug images for suspicious video frames, up to --max-failure-frames.",
@@ -345,6 +367,10 @@ def load_settings():
     return settings
 
 
+def clamp(value, minimum, maximum):
+    return min(max(value, minimum), maximum)
+
+
 def detect_road(frame, settings, last_center_x, frames_since_valid):
     height, width = frame.shape[:2]
     roi_top = int(height * settings["ROI_top_percent"] / 100.0)
@@ -372,12 +398,23 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
     area = int(cv2.countNonZero(mask))
     roi_area = max(1, width * (height - roi_top))
     min_area = roi_area * settings["Min_area_percent"] / 100.0
-    scan_points, boundary_points, rejected_scanlines = estimate_scanline_centers(mask, roi_top)
+    scan_points, boundary_points, rejected_scanlines, seed_center_x, first_anchor_x, first_anchor_distance_px = (
+        estimate_scanline_centers(mask, roi_top, last_center_x, frames_since_valid)
+    )
     tracked_center_valid = len(scan_points) >= 2
 
     road_detected = area > 0 and area >= min_area and tracked_center_valid
-    road_confidence = min(1.0, area / max(1.0, min_area * 3.0)) if road_detected else 0.0
-
+    mask_area_percent = area / roi_area * 100.0
+    mask_area_score = clamp(mask_area_percent / 20.0, 0.0, 1.0)
+    valid_scanline_count = len(scan_points)
+    valid_scanline_score = clamp(valid_scanline_count / SCANLINE_COUNT, 0.0, 1.0)
+    rejected_scanline_score = clamp(1.0 - (rejected_scanlines / SCANLINE_COUNT), 0.0, 1.0)
+    detection_quality = (
+        0.35 * mask_area_score
+        + 0.45 * valid_scanline_score
+        + 0.20 * rejected_scanline_score
+    )
+    road_confidence = detection_quality
 
     road_center_x = None
     road_center_error_px = None
@@ -416,6 +453,11 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
         far_center_x=far_center_x,
         tracked_center_valid=tracked_center_valid,
         rejected_scanlines=rejected_scanlines,
+        valid_scanline_count=valid_scanline_count,
+        detection_quality=detection_quality,
+        seed_center_x=seed_center_x,
+        first_anchor_x=first_anchor_x,
+        first_anchor_distance_px=first_anchor_distance_px,
         scan_points=scan_points,
         boundary_points=boundary_points,
     )
@@ -463,14 +505,20 @@ def keep_relevant_component(mask, settings):
     return np.where(labels == best_label, 255, 0).astype(np.uint8)
 
 
-def estimate_scanline_centers(mask, roi_top):
+def estimate_scanline_centers(mask, roi_top, last_center_x=None, frames_since_valid=LAST_CENTER_HOLD_FRAMES + 1):
     height, width = mask.shape[:2]
     y_values = np.linspace(height - 35, max(roi_top + 10, int(height * 0.52)), SCANLINE_COUNT).astype(int)
 
     raw_points = []
     boundary_points = []
     rejected_scanlines = 0
-    previous_center_x = width / 2.0
+    if last_center_x is not None and frames_since_valid <= LAST_CENTER_HOLD_FRAMES:
+        seed_center_x = float(last_center_x)
+    else:
+        seed_center_x = width / 2.0
+    previous_center_x = seed_center_x
+    first_anchor_x = None
+    first_anchor_distance_px = None
 
     for y in y_values:
         segments = find_road_segments(mask[y, :], MIN_SEGMENT_WIDTH_PX)
@@ -486,6 +534,20 @@ def estimate_scanline_centers(mask, roi_top):
         left_x, right_x, center_x = best_segment
         center_jump = center_x - previous_center_x
 
+        if first_anchor_x is None:
+            first_anchor_x = float(center_x)
+            first_anchor_distance_px = float(abs(center_x - seed_center_x))
+            if not ALLOW_FIRST_ANCHOR_JUMP and abs(center_jump) > MAX_CENTER_JUMP_PX:
+                rejected_scanlines += 1
+                first_anchor_x = None
+                first_anchor_distance_px = None
+                continue
+            raw_points.append((float(center_x), int(left_x), int(right_x), int(y)))
+            boundary_points.append((left_x, int(y)))
+            boundary_points.append((right_x, int(y)))
+            previous_center_x = center_x
+            continue
+
         # Reject large jumps so the path does not snap across a wide
         # intersection to a different road branch in one scanline.
         if abs(center_jump) > MAX_CENTER_JUMP_PX:
@@ -500,7 +562,7 @@ def estimate_scanline_centers(mask, roi_top):
     scan_points = smooth_centerline_points(raw_points)
 
     # Preserve bottom-to-top order for drawing a path from the vehicle forward.
-    return scan_points, boundary_points, rejected_scanlines
+    return scan_points, boundary_points, rejected_scanlines, seed_center_x, first_anchor_x, first_anchor_distance_px
 
 
 def find_road_segments(row_mask, min_width_px):
@@ -737,11 +799,20 @@ def get_output_base_name(video_path):
     return Path(video_path).stem
 
 
-def create_output_folders(output_dir):
+def create_output_folders(output_dir, base_name, clean_output=False):
     # Video output is split in two on purpose:
     # human_output is for a person to watch, while output_for_AI is organized
     # as structured CSV/JSON/text/images for later ChatGPT analysis.
-    root = Path(output_dir)
+    output_root = Path(output_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    root = output_root / f"{base_name}_{timestamp}"
+    if root.exists() and clean_output:
+        shutil.rmtree(root)
+    elif root.exists():
+        suffix = 1
+        while (output_root / f"{base_name}_{timestamp}_{suffix:02d}").exists():
+            suffix += 1
+        root = output_root / f"{base_name}_{timestamp}_{suffix:02d}"
     human_dir = root / "human_output"
     ai_dir = root / "output_for_AI"
     key_frames_dir = human_dir / "key_frames"
@@ -751,8 +822,13 @@ def create_output_folders(output_dir):
     for folder in (human_dir, ai_dir, key_frames_dir, frame_samples_dir, failure_frames_dir):
         folder.mkdir(parents=True, exist_ok=True)
 
+    output_root.mkdir(parents=True, exist_ok=True)
+    latest_run_path = output_root / "latest_run.txt"
+    latest_run_path.write_text(str(root.resolve()) + "\n", encoding="utf-8")
+
     return {
         "root": root,
+        "latest_run": latest_run_path,
         "human": human_dir,
         "ai": ai_dir,
         "key_frames": key_frames_dir,
@@ -761,17 +837,36 @@ def create_output_folders(output_dir):
     }
 
 
-def load_video_settings():
-    # Offline video mode should use the same HSV/ROI values as live mode.
-    # If road_config.json exists, it represents the user's latest saved tuning.
-    loaded = load_settings()
-    if loaded:
-        return loaded
-    return DEFAULT_SETTINGS.copy()
+def load_settings_file(path):
+    with open(path, "r", encoding="utf-8") as file:
+        loaded = json.load(file)
+
+    settings = DEFAULT_SETTINGS.copy()
+    for name in settings:
+        if name in loaded:
+            settings[name] = int(loaded[name])
+    return settings
 
 
-def get_config_used(settings):
+def load_video_settings(args):
+    if args.use_default_config:
+        return DEFAULT_SETTINGS.copy(), "DEFAULT_SETTINGS"
+
+    config_path = Path(args.config)
+    if config_path.exists():
+        source = CONFIG_FILE if str(config_path) == CONFIG_FILE else str(config_path)
+        print(f"Loaded HSV settings from {source}")
+        return load_settings_file(config_path), source
+
+    if args.config != CONFIG_FILE:
+        raise RuntimeError(f"Could not find config file: {config_path}")
+
+    return DEFAULT_SETTINGS.copy(), "DEFAULT_SETTINGS"
+
+
+def get_config_used(settings, config_source=None):
     config = {
+        "config_source": config_source,
         "H_min": settings["H_min"],
         "H_max": settings["H_max"],
         "S_min": settings["S_min"],
@@ -784,6 +879,7 @@ def get_config_used(settings):
         "Min_area_percent": settings["Min_area_percent"],
         "MIN_SEGMENT_WIDTH_PX": MIN_SEGMENT_WIDTH_PX,
         "MAX_CENTER_JUMP_PX": MAX_CENTER_JUMP_PX,
+        "ALLOW_FIRST_ANCHOR_JUMP": ALLOW_FIRST_ANCHOR_JUMP,
         "CENTERLINE_SMOOTHING_ALPHA": CENTERLINE_SMOOTHING_ALPHA,
         "CURVE_DEADBAND_PX": CURVE_DEADBAND_PX,
         "CURVE_STRONG_PX": CURVE_STRONG_PX,
@@ -794,11 +890,11 @@ def get_config_used(settings):
     return config
 
 
-def save_config_used(path, settings):
+def save_config_used(path, settings, config_source):
     # This JSON makes a run reproducible because it records the exact HSV,
     # ROI, scanline, smoothing, and deadband values used for the video.
     with open(path, "w", encoding="utf-8") as file:
-        json.dump(get_config_used(settings), file, indent=2)
+        json.dump(get_config_used(settings, config_source), file, indent=2)
 
 
 def build_road_overlay(frame, mask):
@@ -844,6 +940,11 @@ def build_telemetry_row(frame_index, time_sec, result, confidences, selected_pat
         "far_center_x": safe_number(result.far_center_x),
         "tracked_center_valid": result.tracked_center_valid,
         "rejected_scanlines": result.rejected_scanlines,
+        "valid_scanline_count": result.valid_scanline_count,
+        "detection_quality": f"{result.detection_quality:.4f}",
+        "seed_center_x": f"{result.seed_center_x:.2f}",
+        "first_anchor_x": safe_number(result.first_anchor_x),
+        "first_anchor_distance_px": safe_number(result.first_anchor_distance_px),
         "selected_path": selected_path,
         "straight_confidence": f"{confidences['straight']:.4f}",
         "left_confidence": f"{confidences['left']:.4f}",
@@ -884,15 +985,25 @@ def detect_frame_events(frame_index, time_sec, result, selected_path, turn_hint,
         "turn_hint": turn_hint,
         "selected_path": selected_path,
         "tracked_center_valid": result.tracked_center_valid,
+        "low_confidence": result.road_confidence < 0.60,
+        "rejected_scanlines_high": result.rejected_scanlines >= 5,
     }
 
-    if result.road_confidence < 0.60:
-        events.append(("low_confidence", "", f"{result.road_confidence:.3f}", "Road mask confidence dropped below 0.60."))
-    if result.rejected_scanlines >= 5:
-        events.append(("rejected_scanlines_high", "", result.rejected_scanlines, "Five or more scanlines were rejected."))
-
     if previous_state is None:
+        if current_state["low_confidence"]:
+            events.append(("low_confidence_started", "", f"{result.road_confidence:.3f}", "Road confidence dropped below 0.60."))
+        if current_state["rejected_scanlines_high"]:
+            events.append(("rejected_scanlines_high_started", "", result.rejected_scanlines, "Five or more scanlines were rejected."))
         return events, current_state
+
+    if not previous_state["low_confidence"] and current_state["low_confidence"]:
+        events.append(("low_confidence_started", "", f"{result.road_confidence:.3f}", "Road confidence dropped below 0.60."))
+    if previous_state["low_confidence"] and not current_state["low_confidence"]:
+        events.append(("low_confidence_ended", "", f"{result.road_confidence:.3f}", "Road confidence recovered to 0.60 or higher."))
+    if not previous_state["rejected_scanlines_high"] and current_state["rejected_scanlines_high"]:
+        events.append(("rejected_scanlines_high_started", "", result.rejected_scanlines, "Five or more scanlines were rejected."))
+    if previous_state["rejected_scanlines_high"] and not current_state["rejected_scanlines_high"]:
+        events.append(("rejected_scanlines_high_ended", "", result.rejected_scanlines, "Rejected scanlines dropped below five."))
 
     if previous_state["road_detected"] and not result.road_detected:
         events.append(("road_lost", True, False, "Road detection changed from valid to lost."))
@@ -917,16 +1028,6 @@ def detect_frame_events(frame_index, time_sec, result, selected_path, turn_hint,
         events.append(("turn_hint_changed", previous_state["turn_hint"], turn_hint, "Curve direction hint changed."))
     if previous_state["selected_path"] != selected_path:
         events.append(("selected_path_changed", previous_state["selected_path"], selected_path, "Selected candidate path changed."))
-    if previous_state["tracked_center_valid"] != result.tracked_center_valid:
-        events.append(
-            (
-                "tracked_center_valid_changed",
-                previous_state["tracked_center_valid"],
-                result.tracked_center_valid,
-                "Enough scanline points for tracking changed.",
-            )
-        )
-
     return events, current_state
 
 
@@ -934,16 +1035,16 @@ def failure_reason_from_events(result, events):
     event_types = [event[0] for event in events]
     if not result.road_detected:
         return "road_lost"
-    if "low_confidence" in event_types:
+    if not result.tracked_center_valid:
+        return "tracked_center_invalid"
+    if "low_confidence_started" in event_types:
         return "low_confidence"
     if "center_jump" in event_types:
         return "center_jump"
     if "curve_jump" in event_types:
         return "curve_jump"
-    if "rejected_scanlines_high" in event_types:
+    if "rejected_scanlines_high_started" in event_types:
         return "rejected_scanlines"
-    if not result.tracked_center_valid:
-        return "tracked_center_invalid"
     return None
 
 
@@ -1063,7 +1164,7 @@ def write_human_summary(path, args, processed_frames, duration_sec, stats, recom
         file.write("\n".join(lines) + "\n")
 
 
-def write_ai_summary_json(path, args, processed_frames, total_frames, duration_sec, completed, stopped_early, stats, settings, problem_intervals):
+def write_ai_summary_json(path, args, processed_frames, total_frames, duration_sec, completed, stopped_early, stats, settings, config_source, problem_intervals):
     # AI summary is structured so ChatGPT can reason over the run without
     # guessing values from the annotated video.
     payload = {
@@ -1089,7 +1190,7 @@ def write_ai_summary_json(path, args, processed_frames, total_frames, duration_s
         "tracked_center_invalid_count": stats["tracked_center_invalid_count"],
         "turn_hint_counts": stats["turn_hint_counts"],
         "selected_path_counts": stats["selected_path_counts"],
-        "config_used": get_config_used(settings),
+        "config_used": get_config_used(settings, config_source),
         "known_problem_intervals": problem_intervals,
     }
     with open(path, "w", encoding="utf-8") as file:
@@ -1144,6 +1245,8 @@ def collect_stats(rows, event_counts, processed_frames):
     center_errors = [row["road_center_error_px"] for row in rows if row["road_center_error_px"] != ""]
     curve_errors = [row["curve_error_px"] for row in rows if row["curve_error_px"] != ""]
     road_detected_count = sum(1 for row in rows if row["road_detected"] is True)
+    low_confidence_frame_count = sum(1 for row in rows if float(row["road_confidence"]) < 0.60)
+    rejected_scanline_problem_count = sum(1 for row in rows if int(row["rejected_scanlines"]) >= 5)
     turn_hint_counts = Counter(row["turn_hint"] for row in rows)
     selected_path_counts = Counter(row["selected_path"] for row in rows)
 
@@ -1152,16 +1255,16 @@ def collect_stats(rows, event_counts, processed_frames):
     road_detected_percent = road_detected_count / max(1, processed_frames) * 100.0
 
     major_problems = []
-    if event_counts["low_confidence"] > 0:
-        major_problems.append(f"{event_counts['low_confidence']} low-confidence frames")
+    if low_confidence_frame_count > 0:
+        major_problems.append(f"{low_confidence_frame_count} low-confidence frames")
     if event_counts["road_lost"] > 0:
         major_problems.append(f"{event_counts['road_lost']} road-lost events")
     if event_counts["center_jump"] > 0:
         major_problems.append(f"{event_counts['center_jump']} center-jump events")
     if event_counts["curve_jump"] > 0:
         major_problems.append(f"{event_counts['curve_jump']} curve-jump events")
-    if event_counts["rejected_scanlines_high"] > 0:
-        major_problems.append(f"{event_counts['rejected_scanlines_high']} high rejected-scanline frames")
+    if rejected_scanline_problem_count > 0:
+        major_problems.append(f"{rejected_scanline_problem_count} high rejected-scanline frames")
 
     return {
         "average_road_confidence": average(confidences),
@@ -1172,8 +1275,8 @@ def collect_stats(rows, event_counts, processed_frames):
         "max_abs_road_center_error_px": max(abs_center_errors) if abs_center_errors else 0.0,
         "average_abs_curve_error_px": average(abs_curve_errors),
         "max_abs_curve_error_px": max(abs_curve_errors) if abs_curve_errors else 0.0,
-        "low_confidence_frame_count": event_counts["low_confidence"],
-        "rejected_scanline_problem_count": event_counts["rejected_scanlines_high"],
+        "low_confidence_frame_count": low_confidence_frame_count,
+        "rejected_scanline_problem_count": rejected_scanline_problem_count,
         "center_jump_count": event_counts["center_jump"],
         "curve_jump_count": event_counts["curve_jump"],
         "tracked_center_invalid_count": sum(1 for row in rows if row["tracked_center_valid"] is False),
@@ -1195,9 +1298,10 @@ def process_video_source(args):
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
 
-    folders = create_output_folders(args.output_dir)
     base_name = get_output_base_name(video_path)
-    settings = load_video_settings()
+    folders = create_output_folders(args.output_dir, base_name, args.clean_output)
+    settings, config_source = load_video_settings(args)
+    print(f"Video config source: {config_source}")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     source_fps = cap.get(cv2.CAP_PROP_FPS)
@@ -1229,6 +1333,11 @@ def process_video_source(args):
         "far_center_x",
         "tracked_center_valid",
         "rejected_scanlines",
+        "valid_scanline_count",
+        "detection_quality",
+        "seed_center_x",
+        "first_anchor_x",
+        "first_anchor_distance_px",
         "selected_path",
         "straight_confidence",
         "left_confidence",
@@ -1265,7 +1374,7 @@ def process_video_source(args):
     middle_frame_index = max(0, total_frames // 2) if total_frames > 0 else None
     last_debug_frame = None
 
-    save_config_used(config_path, settings)
+    save_config_used(config_path, settings, config_source)
     write_run_notes(run_notes_path, args, folders)
 
     with open(telemetry_path, "w", newline="", encoding="utf-8") as telemetry_file, open(
@@ -1450,6 +1559,7 @@ def process_video_source(args):
         stopped_early,
         stats,
         settings,
+        config_source,
         problem_intervals,
     )
 

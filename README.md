@@ -57,13 +57,39 @@ Run without opening OpenCV display windows:
 py -3.12 main.py --source video --video assets/test_video.mp4 --no-display
 ```
 
+Run with the built-in defaults from `config.py`, ignoring any saved tuning:
+
+```powershell
+py -3.12 main.py --source video --video assets/test_video.mp4 --use-default-config --no-display
+```
+
+Load a specific saved tuning file:
+
+```powershell
+py -3.12 main.py --source video --video assets/test_video.mp4 --config path\to\road_config.json --no-display
+```
+
 Choose the output folder:
 
 ```powershell
 py -3.12 main.py --source video --video assets/test_video.mp4 --output-dir outputs
 ```
 
-Video mode creates two output folders:
+By default, video mode loads `road_config.json` when that file exists. This lets a saved live tuning carry into offline analysis, but it also means `road_config.json` overrides the defaults in `config.py` unless `--use-default-config` is passed. The file `test_video_config_used.json` records the exact values and `config_source` used for each run.
+
+Video mode writes each run into a timestamped folder so old samples, telemetry, and failure frames do not mix with new results:
+
+```text
+outputs/
+  test_video_YYYYMMDD_HHMMSS/
+    human_output/
+    output_for_AI/
+  latest_run.txt
+```
+
+`outputs/latest_run.txt` points to the most recent run folder. `output_for_AI` lives inside the per-run folder so uploaded AI analysis files all come from the same video pass. Previous runs are kept automatically. Use `--clean-output` only to delete the newly selected timestamped run folder before writing if that exact folder already exists.
+
+Each timestamped run creates two output folders:
 
 - `human_output` is for watching and visually checking the result. It contains the annotated MP4, a short human-readable summary, and representative key frames.
 - `output_for_AI` is for uploading to ChatGPT for deeper analysis. It contains structured CSV/JSON files, run notes, periodic frame samples, and optional failure frames.
@@ -135,7 +161,7 @@ The main window shows:
 - Curve debug values: `curve_error_px`, `turn_hint`, `near_center_x`, and `far_center_x`
 - Tracking debug values: `tracked_center_valid` and `rejected_scanlines`
 
-The center path is tracked from the bottom-center of the image upward. Each scanline is split into continuous road segments, and the segment closest to the previous center is selected. This avoids averaging across the full road width at forks and intersections.
+The center path is tracked from the bottom of the image upward. Each scanline is split into continuous road segments, and the first usable segment is allowed to anchor away from image center when `ALLOW_FIRST_ANCHOR_JUMP = True`; later scanlines still obey `MAX_CENTER_JUMP_PX`. This helps curves and edge-of-road views lock onto the visible road before enforcing continuity.
 
 ## Known Limitations
 
