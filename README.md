@@ -41,6 +41,44 @@ RealSense D435 RGB-only mode:
 py -3.12 main.py --source realsense
 ```
 
+## Video Processing Mode
+
+Offline video processing runs a local video through the same RGB road-mask, centerline, curve, confidence, and candidate-path logic used by the live modes. This is useful for repeatable testing because the same frames can be processed again after tuning changes.
+
+Run the local test video:
+
+```powershell
+py -3.12 main.py --source video --video assets/test_video.mp4
+```
+
+Run without opening OpenCV display windows:
+
+```powershell
+py -3.12 main.py --source video --video assets/test_video.mp4 --no-display
+```
+
+Choose the output folder:
+
+```powershell
+py -3.12 main.py --source video --video assets/test_video.mp4 --output-dir outputs
+```
+
+Video mode creates two output folders:
+
+- `human_output` is for watching and visually checking the result. It contains the annotated MP4, a short human-readable summary, and representative key frames.
+- `output_for_AI` is for uploading to ChatGPT for deeper analysis. It contains structured CSV/JSON files, run notes, periodic frame samples, and optional failure frames.
+
+Files to upload to ChatGPT for analysis:
+
+- `test_video_telemetry.csv`
+- `test_video_events.csv`
+- `test_video_summary_ai.json`
+- `test_video_config_used.json`
+- selected `failure_frames`
+- selected `frame_samples`
+
+The annotated video is best for human visual inspection. The CSV, JSON, frame samples, and failure frames are better for AI debugging because they preserve the detector's numeric state and selected visual evidence. The local file `assets/test_video.mp4` is intentionally not committed and is ignored by git because it is large.
+
 ## Controls
 
 - `q` or `ESC`: quit

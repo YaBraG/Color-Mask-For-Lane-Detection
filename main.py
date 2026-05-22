@@ -1,8 +1,13 @@
 import argparse
+import csv
 import json
 import os
 import sys
+import time
+from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -222,9 +227,29 @@ class PathConfidenceTracker:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RGB-only QCar2 road/drivable-area detection prototype.")
-    parser.add_argument("--source", choices=["image", "webcam", "realsense"], required=True)
+    parser.add_argument("--source", choices=["image", "webcam", "realsense", "video"], required=True)
     parser.add_argument("--image", help="Path to a static image for --source image.")
+    parser.add_argument("--video", help="Path to a video file for --source video.")
     parser.add_argument("--camera-index", type=int, default=0, help="OpenCV webcam index for --source webcam.")
+    parser.add_argument("--output-dir", default="outputs", help="Folder where video-mode outputs are written.")
+    parser.add_argument("--no-display", action="store_true", help="Process video without opening OpenCV windows.")
+    parser.add_argument(
+        "--save-failure-frames",
+        action="store_true",
+        help="Save debug images for suspicious video frames, up to --max-failure-frames.",
+    )
+    parser.add_argument(
+        "--max-failure-frames",
+        type=int,
+        default=100,
+        help="Maximum suspicious-frame debug images to save when --save-failure-frames is used.",
+    )
+    parser.add_argument(
+        "--ai-sample-interval-sec",
+        type=float,
+        default=2.0,
+        help="Seconds between periodic AI frame samples in video mode.",
+    )
     return parser.parse_args()
 
 
@@ -244,6 +269,10 @@ def make_source(args):
         return StaticImageSource(args.image)
     if args.source == "webcam":
         return WebcamSource(args.camera_index)
+    if args.source == "video":
+        if not args.video:
+            raise RuntimeError("--video is required when using --source video")
+        return None
     return RealSenseSource()
 
 
@@ -704,9 +733,746 @@ def handle_key(key, settings):
     return None
 
 
+def get_output_base_name(video_path):
+    return Path(video_path).stem
+
+
+def create_output_folders(output_dir):
+    # Video output is split in two on purpose:
+    # human_output is for a person to watch, while output_for_AI is organized
+    # as structured CSV/JSON/text/images for later ChatGPT analysis.
+    root = Path(output_dir)
+    human_dir = root / "human_output"
+    ai_dir = root / "output_for_AI"
+    key_frames_dir = human_dir / "key_frames"
+    frame_samples_dir = ai_dir / "frame_samples"
+    failure_frames_dir = ai_dir / "failure_frames"
+
+    for folder in (human_dir, ai_dir, key_frames_dir, frame_samples_dir, failure_frames_dir):
+        folder.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "root": root,
+        "human": human_dir,
+        "ai": ai_dir,
+        "key_frames": key_frames_dir,
+        "frame_samples": frame_samples_dir,
+        "failure_frames": failure_frames_dir,
+    }
+
+
+def load_video_settings():
+    # Offline video mode should use the same HSV/ROI values as live mode.
+    # If road_config.json exists, it represents the user's latest saved tuning.
+    loaded = load_settings()
+    if loaded:
+        return loaded
+    return DEFAULT_SETTINGS.copy()
+
+
+def get_config_used(settings):
+    config = {
+        "H_min": settings["H_min"],
+        "H_max": settings["H_max"],
+        "S_min": settings["S_min"],
+        "S_max": settings["S_max"],
+        "V_min": settings["V_min"],
+        "V_max": settings["V_max"],
+        "ROI_top_percent": settings["ROI_top_percent"],
+        "Morph_kernel": settings["Morph_kernel"],
+        "Close_kernel": settings["Close_kernel"],
+        "Min_area_percent": settings["Min_area_percent"],
+        "MIN_SEGMENT_WIDTH_PX": MIN_SEGMENT_WIDTH_PX,
+        "MAX_CENTER_JUMP_PX": MAX_CENTER_JUMP_PX,
+        "CENTERLINE_SMOOTHING_ALPHA": CENTERLINE_SMOOTHING_ALPHA,
+        "CURVE_DEADBAND_PX": CURVE_DEADBAND_PX,
+        "CURVE_STRONG_PX": CURVE_STRONG_PX,
+        "CENTER_DEADBAND_PX": CENTER_DEADBAND_PX,
+        "CENTER_STRONG_PX": CENTER_STRONG_PX,
+        "SCANLINE_COUNT": SCANLINE_COUNT,
+    }
+    return config
+
+
+def save_config_used(path, settings):
+    # This JSON makes a run reproducible because it records the exact HSV,
+    # ROI, scanline, smoothing, and deadband values used for the video.
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(get_config_used(settings), file, indent=2)
+
+
+def build_road_overlay(frame, mask):
+    overlay = frame.copy()
+    mask_pixels = mask > 0
+    if np.any(mask_pixels):
+        overlay[mask_pixels] = cv2.addWeighted(
+            overlay[mask_pixels],
+            0.45,
+            np.full_like(overlay[mask_pixels], (180, 120, 0)),
+            0.55,
+            0,
+        )
+    return overlay
+
+
+def safe_number(value, default=""):
+    if value is None:
+        return default
+    return value
+
+
+def build_telemetry_row(frame_index, time_sec, result, confidences, selected_path, turn_hint, processing_fps):
+    height, width = result.mask.shape[:2]
+    mask_area_pixels = int(cv2.countNonZero(result.mask))
+    mask_area_percent = mask_area_pixels / max(1, width * height) * 100.0
+
+    # road_center_error_px means road center minus camera/image center.
+    # Negative values mean the road is left of the camera; positive values mean it is right.
+    # curve_error_px means far road center minus near road center.
+    # Negative values hint left curvature; positive values hint right curvature.
+    # rejected_scanlines counts scan rows skipped because no usable road segment was found
+    # or because the center jumped too far to trust.
+    return {
+        "frame_index": frame_index,
+        "time_sec": f"{time_sec:.3f}",
+        "road_detected": result.road_detected,
+        "road_confidence": f"{result.road_confidence:.4f}",
+        "road_center_error_px": safe_number(result.road_center_error_px),
+        "curve_error_px": safe_number(result.curve_error_px),
+        "turn_hint": turn_hint,
+        "near_center_x": safe_number(result.near_center_x),
+        "far_center_x": safe_number(result.far_center_x),
+        "tracked_center_valid": result.tracked_center_valid,
+        "rejected_scanlines": result.rejected_scanlines,
+        "selected_path": selected_path,
+        "straight_confidence": f"{confidences['straight']:.4f}",
+        "left_confidence": f"{confidences['left']:.4f}",
+        "right_confidence": f"{confidences['right']:.4f}",
+        "mask_area_pixels": mask_area_pixels,
+        "mask_area_percent": f"{mask_area_percent:.4f}",
+        "centerline_point_count": len(result.scan_points),
+        "processing_fps_estimate": f"{processing_fps:.2f}",
+    }
+
+
+def write_telemetry_row(writer, row):
+    # The telemetry CSV has one row per processed frame so later analysis can
+    # find trends, spikes, and frame ranges without watching the whole video.
+    writer.writerow(row)
+
+
+def write_event_row(writer, frame_index, time_sec, event_type, old_value, new_value, notes):
+    # The events CSV only records important changes so it is quick to skim.
+    writer.writerow(
+        {
+            "frame_index": frame_index,
+            "time_sec": f"{time_sec:.3f}",
+            "event_type": event_type,
+            "old_value": old_value,
+            "new_value": new_value,
+            "notes": notes,
+        }
+    )
+
+
+def detect_frame_events(frame_index, time_sec, result, selected_path, turn_hint, previous_state):
+    events = []
+    current_state = {
+        "road_detected": result.road_detected,
+        "road_center_error_px": result.road_center_error_px,
+        "curve_error_px": result.curve_error_px,
+        "turn_hint": turn_hint,
+        "selected_path": selected_path,
+        "tracked_center_valid": result.tracked_center_valid,
+    }
+
+    if result.road_confidence < 0.60:
+        events.append(("low_confidence", "", f"{result.road_confidence:.3f}", "Road mask confidence dropped below 0.60."))
+    if result.rejected_scanlines >= 5:
+        events.append(("rejected_scanlines_high", "", result.rejected_scanlines, "Five or more scanlines were rejected."))
+
+    if previous_state is None:
+        return events, current_state
+
+    if previous_state["road_detected"] and not result.road_detected:
+        events.append(("road_lost", True, False, "Road detection changed from valid to lost."))
+    if not previous_state["road_detected"] and result.road_detected:
+        events.append(("road_recovered", False, True, "Road detection recovered after being lost."))
+
+    previous_center = previous_state["road_center_error_px"]
+    if previous_center is not None and result.road_center_error_px is not None:
+        center_jump = abs(result.road_center_error_px - previous_center)
+        # MAX_CENTER_JUMP_PX is already the live detector's guardrail for an unsafe center jump.
+        if center_jump > MAX_CENTER_JUMP_PX:
+            events.append(("center_jump", f"{previous_center:.2f}", f"{result.road_center_error_px:.2f}", f"Center error jumped by {center_jump:.1f}px."))
+
+    previous_curve = previous_state["curve_error_px"]
+    if previous_curve is not None and result.curve_error_px is not None:
+        curve_jump = abs(result.curve_error_px - previous_curve)
+        # CURVE_STRONG_PX is the threshold where a curve is considered strongly left/right.
+        if curve_jump > CURVE_STRONG_PX:
+            events.append(("curve_jump", f"{previous_curve:.2f}", f"{result.curve_error_px:.2f}", f"Curve error jumped by {curve_jump:.1f}px."))
+
+    if previous_state["turn_hint"] != turn_hint:
+        events.append(("turn_hint_changed", previous_state["turn_hint"], turn_hint, "Curve direction hint changed."))
+    if previous_state["selected_path"] != selected_path:
+        events.append(("selected_path_changed", previous_state["selected_path"], selected_path, "Selected candidate path changed."))
+    if previous_state["tracked_center_valid"] != result.tracked_center_valid:
+        events.append(
+            (
+                "tracked_center_valid_changed",
+                previous_state["tracked_center_valid"],
+                result.tracked_center_valid,
+                "Enough scanline points for tracking changed.",
+            )
+        )
+
+    return events, current_state
+
+
+def failure_reason_from_events(result, events):
+    event_types = [event[0] for event in events]
+    if not result.road_detected:
+        return "road_lost"
+    if "low_confidence" in event_types:
+        return "low_confidence"
+    if "center_jump" in event_types:
+        return "center_jump"
+    if "curve_jump" in event_types:
+        return "curve_jump"
+    if "rejected_scanlines_high" in event_types:
+        return "rejected_scanlines"
+    if not result.tracked_center_valid:
+        return "tracked_center_invalid"
+    return None
+
+
+def save_failure_frame(debug_frame, folder, frame_index, reason, saved_count, max_count, enabled):
+    # Failure frames are saved so ChatGPT or a human can inspect suspicious
+    # moments directly. They are capped because video can create many images.
+    if not enabled or reason is None or saved_count >= max_count:
+        return saved_count, False
+    path = folder / f"frame_{frame_index:05d}_{reason}_debug.jpg"
+    cv2.imwrite(str(path), debug_frame)
+    return saved_count + 1, True
+
+
+def save_periodic_ai_samples(frame, result, overlay, debug_frame, folder, frame_index, time_sec, next_sample_time, interval_sec):
+    # Periodic samples give AI analysis visual anchors without requiring every
+    # frame. The mask, overlay, and debug view explain different parts of the detector.
+    if interval_sec <= 0 or time_sec + 1e-9 < next_sample_time:
+        return next_sample_time
+
+    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_original.jpg"), frame)
+    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_mask.jpg"), result.mask)
+    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_overlay.jpg"), overlay)
+    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_debug.jpg"), debug_frame)
+    return next_sample_time + interval_sec
+
+
+def save_key_frame(debug_frame, folder, frame_index, label, saved_keys):
+    key = (frame_index, label)
+    if key in saved_keys:
+        return
+    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_{label}.jpg"), debug_frame)
+    saved_keys.add(key)
+
+
+def build_problem_intervals(problem_frames):
+    if not problem_frames:
+        return []
+
+    intervals = []
+    sorted_items = sorted(problem_frames, key=lambda item: (item["reason"], item["frame_index"]))
+    current = None
+
+    for item in sorted_items:
+        frame_index = item["frame_index"]
+        reason = item["reason"]
+        if current is None or current["reason"] != reason or frame_index - current["end_frame"] > 10:
+            if current is not None:
+                intervals.append(current)
+            current = {
+                "start_frame": frame_index,
+                "end_frame": frame_index,
+                "reason": reason,
+                "notes": item["notes"],
+            }
+        else:
+            current["end_frame"] = frame_index
+
+    if current is not None:
+        intervals.append(current)
+    return intervals
+
+
+def average(values):
+    clean_values = [float(value) for value in values if value is not None]
+    if not clean_values:
+        return 0.0
+    return sum(clean_values) / len(clean_values)
+
+
+def most_common_text(values, default="unknown"):
+    if not values:
+        return default
+    return Counter(values).most_common(1)[0][0]
+
+
+def build_recommendations(stats):
+    recommendations = []
+    if stats["road_detected_percent"] < 80.0:
+        recommendations.append("Road detection drops often")
+    if stats["max_abs_road_center_error_px"] > CENTER_STRONG_PX:
+        recommendations.append("Centerline jumps too much")
+    if stats["average_abs_curve_error_px"] > CURVE_DEADBAND_PX:
+        recommendations.append("Curve detection may need tuning")
+    if not recommendations and stats["average_road_confidence"] >= 0.60:
+        recommendations.append("Mask looks stable")
+    if not recommendations:
+        recommendations.append("This video is good enough for next-stage testing")
+    return recommendations
+
+
+def write_human_summary(path, args, processed_frames, duration_sec, stats, recommendations):
+    # Human summary is short prose for deciding whether the annotated video
+    # looks good enough before digging into CSV/JSON details.
+    lines = [
+        "QCar2 RGB road detector video summary",
+        "",
+        f"Input video path: {args.video}",
+        f"Total frames processed: {processed_frames}",
+        f"Duration: {duration_sec:.2f} sec",
+        f"Average road confidence: {stats['average_road_confidence']:.3f}",
+        f"Road detected percent: {stats['road_detected_percent']:.1f}%",
+        f"Average absolute road_center_error_px: {stats['average_abs_road_center_error_px']:.2f}",
+        f"Max absolute road_center_error_px: {stats['max_abs_road_center_error_px']:.2f}",
+        f"Average absolute curve_error_px: {stats['average_abs_curve_error_px']:.2f}",
+        f"Most common turn_hint: {stats['most_common_turn_hint']}",
+        "",
+        "Major problems found:",
+    ]
+    if stats["major_problems"]:
+        lines.extend([f"- {problem}" for problem in stats["major_problems"]])
+    else:
+        lines.append("- None detected from telemetry thresholds.")
+    lines.extend(["", "Simple recommendation:"])
+    lines.extend([f"- {recommendation}" for recommendation in recommendations])
+
+    with open(path, "w", encoding="utf-8") as file:
+        file.write("\n".join(lines) + "\n")
+
+
+def write_ai_summary_json(path, args, processed_frames, total_frames, duration_sec, completed, stopped_early, stats, settings, problem_intervals):
+    # AI summary is structured so ChatGPT can reason over the run without
+    # guessing values from the annotated video.
+    payload = {
+        "input_video": args.video,
+        "output_created_at": datetime.now().isoformat(timespec="seconds"),
+        "total_frames": total_frames,
+        "processed_frames": processed_frames,
+        "duration_sec": duration_sec,
+        "completed_full_video": completed,
+        "stopped_early": stopped_early,
+        "average_road_confidence": stats["average_road_confidence"],
+        "min_road_confidence": stats["min_road_confidence"],
+        "max_road_confidence": stats["max_road_confidence"],
+        "road_detected_percent": stats["road_detected_percent"],
+        "average_abs_road_center_error_px": stats["average_abs_road_center_error_px"],
+        "max_abs_road_center_error_px": stats["max_abs_road_center_error_px"],
+        "average_abs_curve_error_px": stats["average_abs_curve_error_px"],
+        "max_abs_curve_error_px": stats["max_abs_curve_error_px"],
+        "low_confidence_frame_count": stats["low_confidence_frame_count"],
+        "rejected_scanline_problem_count": stats["rejected_scanline_problem_count"],
+        "center_jump_count": stats["center_jump_count"],
+        "curve_jump_count": stats["curve_jump_count"],
+        "tracked_center_invalid_count": stats["tracked_center_invalid_count"],
+        "turn_hint_counts": stats["turn_hint_counts"],
+        "selected_path_counts": stats["selected_path_counts"],
+        "config_used": get_config_used(settings),
+        "known_problem_intervals": problem_intervals,
+    }
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2)
+
+
+def write_run_notes(path, args, folders):
+    # These notes tell a future ChatGPT session what each output means and
+    # which files are worth uploading first.
+    command = " ".join(sys.argv)
+    notes = [
+        "QCar2 RGB road detector offline video run notes",
+        "",
+        f"Command used: {command}",
+        f"Requested video path: {args.video}",
+        f"Outputs root: {folders['root']}",
+        f"Human output folder: {folders['human']}",
+        f"AI output folder: {folders['ai']}",
+        "",
+        "What the detector is supposed to do:",
+        "It uses RGB/OpenCV/NumPy HSV masking to detect the dark road surface, tracks scanline centers, estimates lateral center error, estimates curve direction, and writes an annotated result.",
+        "",
+        "Main output files:",
+        "- human_output annotated MP4: watch this for visual inspection.",
+        "- telemetry CSV: one row per processed frame with numeric detector state.",
+        "- events CSV: only important changes such as road loss, low confidence, jumps, and path changes.",
+        "- summary AI JSON: structured run summary and grouped problem intervals.",
+        "- config used JSON: exact HSV/ROI/math thresholds used for the run.",
+        "- frame_samples: periodic original/mask/overlay/debug images.",
+        "- failure_frames: suspicious debug frames, capped by command-line settings.",
+        "",
+        "Known limitations:",
+        "- No machine learning, no training, no YOLO, no PyTorch, no TensorFlow.",
+        "- RGB only; no ROS2 and no RealSense depth processing yet.",
+        "- Lighting changes and road color changes may require HSV retuning.",
+        "- Candidate paths are simple visual hints; the detected centerline is the main output.",
+        "",
+        "Files to upload to ChatGPT for analysis:",
+        "- test_video_telemetry.csv",
+        "- test_video_events.csv",
+        "- test_video_summary_ai.json",
+        "- test_video_config_used.json",
+        "- selected frame_samples",
+        "- selected failure_frames",
+    ]
+    with open(path, "w", encoding="utf-8") as file:
+        file.write("\n".join(notes) + "\n")
+
+
+def collect_stats(rows, event_counts, processed_frames):
+    confidences = [float(row["road_confidence"]) for row in rows]
+    center_errors = [row["road_center_error_px"] for row in rows if row["road_center_error_px"] != ""]
+    curve_errors = [row["curve_error_px"] for row in rows if row["curve_error_px"] != ""]
+    road_detected_count = sum(1 for row in rows if row["road_detected"] is True)
+    turn_hint_counts = Counter(row["turn_hint"] for row in rows)
+    selected_path_counts = Counter(row["selected_path"] for row in rows)
+
+    abs_center_errors = [abs(float(value)) for value in center_errors]
+    abs_curve_errors = [abs(float(value)) for value in curve_errors]
+    road_detected_percent = road_detected_count / max(1, processed_frames) * 100.0
+
+    major_problems = []
+    if event_counts["low_confidence"] > 0:
+        major_problems.append(f"{event_counts['low_confidence']} low-confidence frames")
+    if event_counts["road_lost"] > 0:
+        major_problems.append(f"{event_counts['road_lost']} road-lost events")
+    if event_counts["center_jump"] > 0:
+        major_problems.append(f"{event_counts['center_jump']} center-jump events")
+    if event_counts["curve_jump"] > 0:
+        major_problems.append(f"{event_counts['curve_jump']} curve-jump events")
+    if event_counts["rejected_scanlines_high"] > 0:
+        major_problems.append(f"{event_counts['rejected_scanlines_high']} high rejected-scanline frames")
+
+    return {
+        "average_road_confidence": average(confidences),
+        "min_road_confidence": min(confidences) if confidences else 0.0,
+        "max_road_confidence": max(confidences) if confidences else 0.0,
+        "road_detected_percent": road_detected_percent,
+        "average_abs_road_center_error_px": average(abs_center_errors),
+        "max_abs_road_center_error_px": max(abs_center_errors) if abs_center_errors else 0.0,
+        "average_abs_curve_error_px": average(abs_curve_errors),
+        "max_abs_curve_error_px": max(abs_curve_errors) if abs_curve_errors else 0.0,
+        "low_confidence_frame_count": event_counts["low_confidence"],
+        "rejected_scanline_problem_count": event_counts["rejected_scanlines_high"],
+        "center_jump_count": event_counts["center_jump"],
+        "curve_jump_count": event_counts["curve_jump"],
+        "tracked_center_invalid_count": sum(1 for row in rows if row["tracked_center_valid"] is False),
+        "turn_hint_counts": dict(turn_hint_counts),
+        "selected_path_counts": dict(selected_path_counts),
+        "most_common_turn_hint": most_common_text([row["turn_hint"] for row in rows]),
+        "major_problems": major_problems,
+    }
+
+
+def process_video_source(args):
+    # Offline video mode is useful because it lets the exact same RGB detector
+    # be replayed, measured, and inspected without needing the QCar2 or camera live.
+    video_path = Path(args.video)
+    if not video_path.exists():
+        raise RuntimeError(f"Could not find video: {video_path}")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    folders = create_output_folders(args.output_dir)
+    base_name = get_output_base_name(video_path)
+    settings = load_video_settings()
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    source_fps = cap.get(cv2.CAP_PROP_FPS)
+    if source_fps <= 0:
+        source_fps = 30.0
+
+    annotated_path = folders["human"] / f"{base_name}_annotated.mp4"
+    telemetry_path = folders["ai"] / f"{base_name}_telemetry.csv"
+    events_path = folders["ai"] / f"{base_name}_events.csv"
+    summary_path = folders["human"] / f"{base_name}_summary.txt"
+    ai_summary_path = folders["ai"] / f"{base_name}_summary_ai.json"
+    config_path = folders["ai"] / f"{base_name}_config_used.json"
+    run_notes_path = folders["ai"] / f"{base_name}_run_notes.txt"
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(annotated_path), fourcc, source_fps, (FRAME_WIDTH, FRAME_HEIGHT))
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not create annotated video: {annotated_path}")
+
+    telemetry_fields = [
+        "frame_index",
+        "time_sec",
+        "road_detected",
+        "road_confidence",
+        "road_center_error_px",
+        "curve_error_px",
+        "turn_hint",
+        "near_center_x",
+        "far_center_x",
+        "tracked_center_valid",
+        "rejected_scanlines",
+        "selected_path",
+        "straight_confidence",
+        "left_confidence",
+        "right_confidence",
+        "mask_area_pixels",
+        "mask_area_percent",
+        "centerline_point_count",
+        "processing_fps_estimate",
+    ]
+    event_fields = ["frame_index", "time_sec", "event_type", "old_value", "new_value", "notes"]
+
+    if not args.no_display:
+        create_trackbars(settings)
+        cv2.namedWindow(WINDOW_MAIN, cv2.WINDOW_NORMAL)
+
+    tracker = PathConfidenceTracker()
+    show_mask_window = False
+    show_candidates = True
+    paused = False
+    stopped_early = False
+    last_center_x = None
+    frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
+    frame_index = 0
+    processed_frames = 0
+    failure_saved_count = 0
+    last_progress_time = time.perf_counter()
+    run_start_time = time.perf_counter()
+    next_sample_time = 0.0
+    previous_state = None
+    rows = []
+    event_counts = Counter()
+    problem_frames = []
+    saved_keys = set()
+    middle_frame_index = max(0, total_frames // 2) if total_frames > 0 else None
+    last_debug_frame = None
+
+    save_config_used(config_path, settings)
+    write_run_notes(run_notes_path, args, folders)
+
+    with open(telemetry_path, "w", newline="", encoding="utf-8") as telemetry_file, open(
+        events_path, "w", newline="", encoding="utf-8"
+    ) as events_file:
+        telemetry_writer = csv.DictWriter(telemetry_file, fieldnames=telemetry_fields)
+        events_writer = csv.DictWriter(events_file, fieldnames=event_fields)
+        telemetry_writer.writeheader()
+        events_writer.writeheader()
+
+        try:
+            while True:
+                if paused:
+                    key = cv2.waitKey(40) & 0xFF
+                    action = handle_key(key, settings)
+                    if action == "quit":
+                        stopped_early = True
+                        break
+                    if action == "toggle_pause":
+                        paused = False
+                        print("Unpaused.")
+                    continue
+
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+
+                frame = resize_frame(frame)
+                if not args.no_display:
+                    settings = get_trackbar_settings()
+
+                time_sec = frame_index / source_fps
+                elapsed = max(0.001, time.perf_counter() - run_start_time)
+                processing_fps = processed_frames / elapsed
+
+                result = detect_road(frame, settings, last_center_x, frames_since_valid)
+
+                if result.road_detected and result.road_center_x is not None:
+                    last_center_x = result.road_center_x
+                    frames_since_valid = 0
+                else:
+                    frames_since_valid += 1
+
+                confidences, selected_path, smoothed_curve_error_px, turn_hint = tracker.update(
+                    result.road_center_error_px,
+                    result.curve_error_px,
+                    result.road_detected,
+                )
+                debug_frame = draw_visualization(
+                    frame,
+                    result,
+                    confidences,
+                    selected_path,
+                    smoothed_curve_error_px,
+                    turn_hint,
+                    show_candidates,
+                )
+                overlay = build_road_overlay(frame, result.mask)
+                writer.write(debug_frame)
+                last_debug_frame = debug_frame.copy()
+
+                telemetry_row = build_telemetry_row(
+                    frame_index,
+                    time_sec,
+                    result,
+                    confidences,
+                    selected_path,
+                    turn_hint,
+                    processing_fps,
+                )
+                write_telemetry_row(telemetry_writer, telemetry_row)
+                rows.append(telemetry_row)
+
+                events, previous_state = detect_frame_events(
+                    frame_index,
+                    time_sec,
+                    result,
+                    selected_path,
+                    turn_hint,
+                    previous_state,
+                )
+                for event_type, old_value, new_value, notes in events:
+                    write_event_row(events_writer, frame_index, time_sec, event_type, old_value, new_value, notes)
+                    event_counts[event_type] += 1
+                    if event_type in ("turn_hint_changed", "road_lost", "road_recovered"):
+                        save_key_frame(debug_frame, folders["key_frames"], frame_index, event_type, saved_keys)
+
+                failure_reason = failure_reason_from_events(result, events)
+                if failure_reason is not None:
+                    problem_frames.append(
+                        {
+                            "frame_index": frame_index,
+                            "reason": failure_reason,
+                            "notes": f"Suspicious frame detected because of {failure_reason}.",
+                        }
+                    )
+                failure_saved_count, _saved = save_failure_frame(
+                    debug_frame,
+                    folders["failure_frames"],
+                    frame_index,
+                    failure_reason,
+                    failure_saved_count,
+                    max(0, args.max_failure_frames),
+                    args.save_failure_frames,
+                )
+
+                next_sample_time = save_periodic_ai_samples(
+                    frame,
+                    result,
+                    overlay,
+                    debug_frame,
+                    folders["frame_samples"],
+                    frame_index,
+                    time_sec,
+                    next_sample_time,
+                    args.ai_sample_interval_sec,
+                )
+
+                if frame_index == 0:
+                    save_key_frame(debug_frame, folders["key_frames"], frame_index, "start", saved_keys)
+                if middle_frame_index is not None and frame_index == middle_frame_index:
+                    save_key_frame(debug_frame, folders["key_frames"], frame_index, "middle", saved_keys)
+
+                processed_frames += 1
+                now = time.perf_counter()
+                if now - last_progress_time >= 3.0:
+                    percent = frame_index / max(1, total_frames) * 100.0 if total_frames > 0 else 0.0
+                    print(
+                        f"Video progress: frame {frame_index}/{total_frames} "
+                        f"({percent:.1f}%), processing {processing_fps:.1f} FPS"
+                    )
+                    last_progress_time = now
+
+                if not args.no_display:
+                    cv2.imshow(WINDOW_MAIN, build_display_grid(frame, result, debug_frame))
+                    if show_mask_window:
+                        cv2.imshow(WINDOW_MASK, result.mask)
+                    else:
+                        try:
+                            cv2.destroyWindow(WINDOW_MASK)
+                        except cv2.error:
+                            pass
+
+                    key = cv2.waitKey(1) & 0xFF
+                    action = handle_key(key, settings)
+                    if action == "quit":
+                        stopped_early = True
+                        break
+                    if action == "toggle_mask":
+                        show_mask_window = not show_mask_window
+                    elif action == "toggle_pause":
+                        paused = True
+                        print("Paused.")
+                    elif action == "toggle_candidates":
+                        show_candidates = not show_candidates
+                        print("Candidate paths on." if show_candidates else "Candidate paths off.")
+
+                frame_index += 1
+        finally:
+            cap.release()
+            writer.release()
+            if not args.no_display:
+                cv2.destroyAllWindows()
+
+    if last_debug_frame is not None:
+        save_key_frame(last_debug_frame, folders["key_frames"], max(0, frame_index - 1), "end", saved_keys)
+
+    duration_sec = processed_frames / source_fps if source_fps > 0 else 0.0
+    completed = not stopped_early and (total_frames <= 0 or processed_frames >= total_frames)
+    stats = collect_stats(rows, event_counts, processed_frames)
+    recommendations = build_recommendations(stats)
+    problem_intervals = build_problem_intervals(problem_frames)
+
+    write_human_summary(summary_path, args, processed_frames, duration_sec, stats, recommendations)
+    write_ai_summary_json(
+        ai_summary_path,
+        args,
+        processed_frames,
+        total_frames,
+        duration_sec,
+        completed,
+        stopped_early,
+        stats,
+        settings,
+        problem_intervals,
+    )
+
+    print()
+    print("Video processing complete.")
+    print(f"Output folder: {folders['root']}")
+    print(f"Human output: {folders['human']}")
+    print(f"AI output: {folders['ai']}")
+    print(f"Frames processed: {processed_frames}")
+    print(f"Failure frames saved: {failure_saved_count}")
+    return 0
+
+
 def main():
     args = parse_args()
     print_startup(args)
+
+    if args.source == "video":
+        try:
+            return process_video_source(args)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}")
+            return 1
 
     try:
         source = make_source(args)

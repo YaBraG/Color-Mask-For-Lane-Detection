@@ -181,3 +181,14 @@ cython_debug/
 .cursorindexingignore
 /.vscode
 assets/test_video.mp4
+
+# Local videos and generated detector outputs
+assets/*.mp4
+assets/*.avi
+assets/*.mov
+outputs/
+output/
+output_for_AI/
+human_output/
+outputs/**/*.mp4
+*.pyc
