@@ -41,6 +41,21 @@ from config import (
     WINDOW_TUNING,
 )
 
+WINDOW_VIDEO_CONTROL = "Video Control"
+MANUAL_TUNING_NOTE = "Manual video tuning baseline for future auto-tuning"
+AUTO_TUNING_NOTE = (
+    "This config should be used as the center/seed for the future auto-tuning search. "
+    "Auto-tuning should explore small ranges around these values first."
+)
+OPTIONAL_TRACKBAR_RANGES = {
+    # Planning-mask controls are not used yet. If they are added to
+    # DEFAULT_SETTINGS later, these ranges let manual tuning expose them
+    # without breaking older configs that do not contain the keys.
+    "Planning_close_w": 101,
+    "Planning_close_h": 101,
+    "Planning_dilate_iterations": 10,
+}
+
 
 @dataclass
 class RoadResult:
@@ -241,15 +256,23 @@ def parse_args():
     parser.add_argument("--output-dir", default="outputs", help="Folder where video-mode outputs are written.")
     parser.add_argument("--no-display", action="store_true", help="Process video without opening OpenCV windows.")
     parser.add_argument(
+        "--tune-video",
+        action="store_true",
+        help="Open an interactive manual tuning mode for --source video instead of full analysis.",
+    )
+    parser.add_argument(
         "--use-default-config",
         action="store_true",
         help="Use DEFAULT_SETTINGS from config.py for video mode and ignore road_config.json.",
     )
     parser.add_argument(
         "--config",
-        default=CONFIG_FILE,
-        help="Config JSON to load for video mode. Defaults to road_config.json when it exists.",
+        help="Config JSON to load. Video analysis defaults to road_config.json when it exists; tuning mode loads only explicit paths.",
     )
+    parser.add_argument("--config-output", default="configs/manual_tuned_config.json", help="Where manual video tuning saves the baseline config.")
+    parser.add_argument("--session-output", default="configs/manual_tuning_session.json", help="Where manual video tuning saves session notes and sample frame lists.")
+    parser.add_argument("--start-frame", type=int, default=0, help="Frame index where manual video tuning starts.")
+    parser.add_argument("--playback-speed", type=float, default=1.0, help="Manual tuning playback speed multiplier.")
     parser.add_argument(
         "--clean-output",
         action="store_true",
@@ -305,7 +328,10 @@ def resize_frame(frame):
 def create_trackbars(settings):
     cv2.namedWindow(WINDOW_TUNING, cv2.WINDOW_NORMAL)
     for name, default_value in settings.items():
-        cv2.createTrackbar(name, WINDOW_TUNING, int(default_value), TRACKBAR_RANGES[name], nothing)
+        max_value = TRACKBAR_RANGES.get(name, OPTIONAL_TRACKBAR_RANGES.get(name))
+        if max_value is None:
+            continue
+        cv2.createTrackbar(name, WINDOW_TUNING, int(default_value), max_value, nothing)
 
 
 def nothing(_value):
@@ -315,7 +341,10 @@ def nothing(_value):
 def get_trackbar_settings():
     settings = {}
     for name in DEFAULT_SETTINGS:
-        settings[name] = cv2.getTrackbarPos(name, WINDOW_TUNING)
+        try:
+            settings[name] = cv2.getTrackbarPos(name, WINDOW_TUNING)
+        except cv2.error:
+            settings[name] = DEFAULT_SETTINGS[name]
 
     if settings["H_min"] > settings["H_max"]:
         settings["H_min"], settings["H_max"] = settings["H_max"], settings["H_min"]
@@ -342,7 +371,10 @@ def get_trackbar_settings():
 
 def set_trackbars(settings):
     for name, value in settings.items():
-        cv2.setTrackbarPos(name, WINDOW_TUNING, int(value))
+        try:
+            cv2.setTrackbarPos(name, WINDOW_TUNING, int(value))
+        except cv2.error:
+            pass
 
 
 def save_settings(settings):
@@ -405,9 +437,16 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
 
     road_detected = area > 0 and area >= min_area and tracked_center_valid
     mask_area_percent = area / roi_area * 100.0
+    # mask_area_score compares the white road mask to a practical 20% ROI
+    # reference area. This keeps confidence useful even when Min_area_percent
+    # is very small or zero in an experimental config.
     mask_area_score = clamp(mask_area_percent / 20.0, 0.0, 1.0)
     valid_scanline_count = len(scan_points)
+    # valid_scanline_score measures how many of the planned horizontal scan
+    # rows found a usable road segment.
     valid_scanline_score = clamp(valid_scanline_count / SCANLINE_COUNT, 0.0, 1.0)
+    # rejected_scanline_score rewards masks that do not force the tracker to
+    # reject many scan rows because of missing road or impossible center jumps.
     rejected_scanline_score = clamp(1.0 - (rejected_scanlines / SCANLINE_COUNT), 0.0, 1.0)
     detection_quality = (
         0.35 * mask_area_score
@@ -852,16 +891,127 @@ def load_video_settings(args):
     if args.use_default_config:
         return DEFAULT_SETTINGS.copy(), "DEFAULT_SETTINGS"
 
-    config_path = Path(args.config)
+    config_path = Path(args.config or CONFIG_FILE)
     if config_path.exists():
         source = CONFIG_FILE if str(config_path) == CONFIG_FILE else str(config_path)
         print(f"Loaded HSV settings from {source}")
         return load_settings_file(config_path), source
 
-    if args.config != CONFIG_FILE:
+    if args.config is not None:
         raise RuntimeError(f"Could not find config file: {config_path}")
 
     return DEFAULT_SETTINGS.copy(), "DEFAULT_SETTINGS"
+
+
+def load_manual_tuning_settings(args):
+    # Manual tuning is meant to find a fresh baseline. It starts from the code
+    # defaults unless the user deliberately points at a previous config file.
+    if args.config is None:
+        return DEFAULT_SETTINGS.copy(), "DEFAULT_SETTINGS"
+
+    config_path = Path(args.config)
+    if not config_path.exists():
+        raise RuntimeError(f"Could not find config file: {config_path}")
+
+    return load_settings_file(config_path), str(config_path)
+
+
+def create_manual_tuning_folders():
+    # Good and difficult samples become visual evidence for the future
+    # auto-tuner, so they live in stable folders instead of per-analysis runs.
+    root = Path("outputs") / "manual_tuning"
+    folders = {
+        "root": root,
+        "good_samples": root / "good_samples",
+        "difficult_samples": root / "difficult_samples",
+        "debug_snapshots": root / "debug_snapshots",
+    }
+    Path("configs").mkdir(parents=True, exist_ok=True)
+    for folder in folders.values():
+        folder.mkdir(parents=True, exist_ok=True)
+    return folders
+
+
+def save_manual_tuning_config(path, settings, source_video, frame_index):
+    # HSV controls select which colors count as road. ROI/morphology controls
+    # clean that mask. This saved file is the human-picked seed for later
+    # self-tuning, so the optimizer can search near a reasonable baseline.
+    payload = {name: int(settings[name]) for name in DEFAULT_SETTINGS}
+    payload.update(
+        {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "source_video": str(source_video),
+            "source_frame_index": int(frame_index),
+            "note": MANUAL_TUNING_NOTE,
+        }
+    )
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2)
+    print(f"Saved manual tuning config to {path}")
+
+
+def save_manual_tuning_session(path, source_video, last_saved_frame_index, config_output_path, session, settings):
+    # The session file records which frames were useful during manual tuning.
+    # Future auto-tuning can replay those frames before trying larger searches.
+    payload = {
+        "source_video": str(source_video),
+        "last_saved_frame_index": last_saved_frame_index,
+        "config_output_path": str(config_output_path),
+        "good_sample_frames": session["good_sample_frames"],
+        "difficult_sample_frames": session["difficult_sample_frames"],
+        "debug_snapshot_frames": session["debug_snapshot_frames"],
+        "final_config": {name: int(settings[name]) for name in DEFAULT_SETTINGS},
+        "notes_for_auto_tuning": AUTO_TUNING_NOTE,
+    }
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2)
+
+
+def save_tuning_sample(kind, folders, frame_index, frame, result, overlay, debug_frame):
+    # Good samples show frames where the current mask works well. Difficult
+    # samples show where tuning or the future auto-tuner still needs attention.
+    if kind == "good":
+        folder = folders["good_samples"]
+        frame_list_name = "good_sample_frames"
+        save_overlay = False
+    elif kind == "difficult":
+        folder = folders["difficult_samples"]
+        frame_list_name = "difficult_sample_frames"
+        save_overlay = False
+    else:
+        folder = folders["debug_snapshots"]
+        frame_list_name = "debug_snapshot_frames"
+        save_overlay = True
+
+    prefix = folder / f"frame_{frame_index:06d}"
+    cv2.imwrite(str(prefix) + "_original.jpg", frame)
+    cv2.imwrite(str(prefix) + "_mask.jpg", result.mask)
+    if save_overlay:
+        cv2.imwrite(str(prefix) + "_overlay.jpg", overlay)
+    cv2.imwrite(str(prefix) + "_debug.jpg", debug_frame)
+    print(f"Saved {kind} tuning sample for frame {frame_index}")
+    return frame_list_name
+
+
+def seek_video_frame(cap, frame_index, total_frames):
+    # OpenCV can jump directly by frame index for normal MP4 files. We clamp
+    # the requested frame so stepping cannot seek before the start or past end.
+    if total_frames > 0:
+        frame_index = min(max(0, int(frame_index)), total_frames - 1)
+    else:
+        frame_index = max(0, int(frame_index))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+    return frame_index
+
+
+def update_video_control_trackbar(frame_index, total_frames):
+    if total_frames <= 0:
+        return
+    cv2.setTrackbarPos("Frame", WINDOW_VIDEO_CONTROL, int(frame_index))
 
 
 def get_config_used(settings, config_source=None):
@@ -1287,6 +1437,207 @@ def collect_stats(rows, event_counts, processed_frames):
     }
 
 
+def process_video_tuning_mode(args):
+    # Manual video tuning is a human-in-the-loop step before auto-tuning. The
+    # user pauses on hard frames, adjusts simple RGB/OpenCV/NumPy mask values,
+    # and saves a good baseline instead of letting an optimizer start randomly.
+    if not args.video:
+        raise RuntimeError("--video is required when using --tune-video")
+    video_path = Path(args.video)
+    if not video_path.exists():
+        raise RuntimeError(f"Could not find video: {video_path}")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    settings, config_source = load_manual_tuning_settings(args)
+    print(f"Manual tuning config source: {config_source}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    source_fps = cap.get(cv2.CAP_PROP_FPS)
+    if source_fps <= 0:
+        source_fps = 30.0
+
+    folders = create_manual_tuning_folders()
+    config_output_path = Path(args.config_output)
+    session_output_path = Path(args.session_output)
+    session = {
+        "good_sample_frames": [],
+        "difficult_sample_frames": [],
+        "debug_snapshot_frames": [],
+    }
+    last_saved_frame_index = None
+
+    # Trackbars expose the same beginner-friendly parameters as live tuning:
+    # HSV chooses road-colored pixels, ROI_top_percent ignores the upper scene,
+    # Morph_kernel removes small white noise, and Close_kernel fills small gaps.
+    create_trackbars(settings)
+    cv2.namedWindow(WINDOW_MAIN, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(WINDOW_VIDEO_CONTROL, cv2.WINDOW_NORMAL)
+    cv2.createTrackbar("Frame", WINDOW_VIDEO_CONTROL, 0, max(1, total_frames - 1), nothing)
+
+    current_frame_index = seek_video_frame(cap, args.start_frame, total_frames)
+    update_video_control_trackbar(current_frame_index, total_frames)
+    playback_speed = max(0.1, float(args.playback_speed))
+    paused = False
+    show_mask_window = False
+    show_candidates = True
+    last_center_x = None
+    frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
+    tracker = PathConfidenceTracker()
+
+    print("Manual video tuning controls:")
+    print("q/ESC quit | p/SPACE pause | s save config | l load config-output | r reset")
+    print("g good sample | f difficult sample | d debug snapshot | n/right next | b/left back")
+
+    try:
+        while True:
+            control_frame = cv2.getTrackbarPos("Frame", WINDOW_VIDEO_CONTROL)
+            if total_frames > 0 and control_frame != current_frame_index:
+                current_frame_index = seek_video_frame(cap, control_frame, total_frames)
+                last_center_x = None
+                frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_index)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+
+            frame = resize_frame(frame)
+            settings = get_trackbar_settings()
+            result = detect_road(frame, settings, last_center_x, frames_since_valid)
+            if result.road_detected and result.road_center_x is not None:
+                last_center_x = result.road_center_x
+                frames_since_valid = 0
+            else:
+                frames_since_valid += 1
+
+            confidences, selected_path, smoothed_curve_error_px, turn_hint = tracker.update(
+                result.road_center_error_px,
+                result.curve_error_px,
+                result.road_detected,
+            )
+            debug_frame = draw_visualization(
+                frame,
+                result,
+                confidences,
+                selected_path,
+                smoothed_curve_error_px,
+                turn_hint,
+                show_candidates,
+            )
+            overlay = build_road_overlay(frame, result.mask)
+            display = build_display_grid(frame, result, debug_frame)
+            cv2.putText(
+                display,
+                f"Frame {current_frame_index}/{max(0, total_frames - 1)}  speed {playback_speed:.1f}x",
+                (12, FRAME_HEIGHT - 14),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.62,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.imshow(WINDOW_MAIN, display)
+            if show_mask_window:
+                cv2.imshow(WINDOW_MASK, result.mask)
+            else:
+                try:
+                    cv2.destroyWindow(WINDOW_MASK)
+                except cv2.error:
+                    pass
+
+            update_video_control_trackbar(current_frame_index, total_frames)
+            delay_ms = 40 if paused else max(1, int(1000.0 / (source_fps * playback_speed)))
+            key = cv2.waitKeyEx(delay_ms)
+
+            if key in (ord("q"), 27):
+                break
+            if key in (ord("p"), 32):
+                paused = not paused
+                print("Paused." if paused else "Playing.")
+            elif key == ord("s"):
+                save_manual_tuning_config(config_output_path, settings, video_path, current_frame_index)
+                last_saved_frame_index = current_frame_index
+                save_manual_tuning_session(
+                    session_output_path,
+                    video_path,
+                    last_saved_frame_index,
+                    config_output_path,
+                    session,
+                    settings,
+                )
+            elif key == ord("l"):
+                if config_output_path.exists():
+                    settings = load_settings_file(config_output_path)
+                    set_trackbars(settings)
+                    print(f"Loaded manual tuning config from {config_output_path}")
+                else:
+                    print(f"No manual tuning config found at {config_output_path}")
+            elif key == ord("r"):
+                settings = DEFAULT_SETTINGS.copy()
+                set_trackbars(settings)
+                last_center_x = None
+                frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
+                print("Reset tuning settings to DEFAULT_SETTINGS.")
+            elif key == ord("m"):
+                show_mask_window = not show_mask_window
+            elif key == ord("c"):
+                show_candidates = not show_candidates
+            elif key in (ord("n"), 83, 2555904):
+                paused = True
+                current_frame_index = seek_video_frame(cap, current_frame_index + 1, total_frames)
+            elif key in (ord("b"), 81, 2424832):
+                paused = True
+                current_frame_index = seek_video_frame(cap, current_frame_index - 1, total_frames)
+            elif key == ord("g"):
+                list_name = save_tuning_sample("good", folders, current_frame_index, frame, result, overlay, debug_frame)
+                if current_frame_index not in session[list_name]:
+                    session[list_name].append(current_frame_index)
+                save_manual_tuning_session(session_output_path, video_path, last_saved_frame_index, config_output_path, session, settings)
+            elif key == ord("f"):
+                list_name = save_tuning_sample("difficult", folders, current_frame_index, frame, result, overlay, debug_frame)
+                if current_frame_index not in session[list_name]:
+                    session[list_name].append(current_frame_index)
+                save_manual_tuning_session(session_output_path, video_path, last_saved_frame_index, config_output_path, session, settings)
+            elif key == ord("d"):
+                list_name = save_tuning_sample("debug", folders, current_frame_index, frame, result, overlay, debug_frame)
+                if current_frame_index not in session[list_name]:
+                    session[list_name].append(current_frame_index)
+                save_manual_tuning_session(session_output_path, video_path, last_saved_frame_index, config_output_path, session, settings)
+            elif key == ord("["):
+                playback_speed = max(0.1, playback_speed / 1.25)
+                print(f"Playback speed: {playback_speed:.2f}x")
+            elif key == ord("]"):
+                playback_speed = min(8.0, playback_speed * 1.25)
+                print(f"Playback speed: {playback_speed:.2f}x")
+
+            if not paused and key not in (ord("n"), ord("b"), 83, 81, 2555904, 2424832):
+                current_frame_index += 1
+                if total_frames > 0 and current_frame_index >= total_frames:
+                    current_frame_index = total_frames - 1
+                    paused = True
+
+    finally:
+        save_manual_tuning_session(
+            session_output_path,
+            video_path,
+            last_saved_frame_index,
+            config_output_path,
+            session,
+            settings,
+        )
+        cap.release()
+        cv2.destroyAllWindows()
+
+    print("Manual video tuning complete.")
+    print(f"Manual config output: {config_output_path}")
+    print(f"Session output: {session_output_path}")
+    print(f"Sample folders: {folders['root']}")
+    return 0
+
+
 def process_video_source(args):
     # Offline video mode is useful because it lets the exact same RGB detector
     # be replayed, measured, and inspected without needing the QCar2 or camera live.
@@ -1579,6 +1930,8 @@ def main():
 
     if args.source == "video":
         try:
+            if args.tune_video:
+                return process_video_tuning_mode(args)
             return process_video_source(args)
         except RuntimeError as exc:
             print(f"ERROR: {exc}")

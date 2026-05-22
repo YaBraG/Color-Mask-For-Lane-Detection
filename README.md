@@ -105,6 +105,61 @@ Files to upload to ChatGPT for analysis:
 
 The annotated video is best for human visual inspection. The CSV, JSON, frame samples, and failure frames are better for AI debugging because they preserve the detector's numeric state and selected visual evidence. The local file `assets/test_video.mp4` is intentionally not committed and is ignored by git because it is large.
 
+## Manual Video Tuning Mode
+
+Manual video tuning plays a recorded QCar2 ride with the same 2x2 display used by the detector: original RGB, road mask, road overlay, and detected center path/debug view. It is for finding a good RGB/OpenCV/NumPy baseline config before building the future auto-tuning optimizer.
+
+Run manual tuning:
+
+```powershell
+py -3.12 main.py --source video --video assets/test_video.mp4 --tune-video
+```
+
+Save the current tuning values by pressing `s`. By default, the config is saved to:
+
+```text
+configs/manual_tuned_config.json
+```
+
+You can choose a different output path:
+
+```powershell
+py -3.12 main.py --source video --video assets/test_video.mp4 --tune-video --config-output configs/manual_tuned_config.json
+```
+
+Manual tuning starts from `DEFAULT_SETTINGS` unless `--config` is explicitly provided. To start from an existing saved config:
+
+```powershell
+py -3.12 main.py --source video --video assets/test_video.mp4 --tune-video --config configs/manual_tuned_config.json
+```
+
+Useful keys:
+
+- `p` or `SPACE`: pause/unpause
+- `s`: save `configs/manual_tuned_config.json`
+- `l`: load from `--config-output`
+- `r`: reset to `DEFAULT_SETTINGS`
+- `n` or right arrow: step forward while paused
+- `b` or left arrow: step backward
+- `g`: save a good tuning sample
+- `f`: save a difficult tuning sample
+- `d`: save a full debug snapshot
+- `[` and `]`: decrease/increase playback speed
+- `q` or `ESC`: quit
+
+Samples are saved here:
+
+```text
+outputs/manual_tuning/
+  good_samples/
+  difficult_samples/
+  debug_snapshots/
+```
+
+`g` and `f` save original, mask, and debug images. `d` saves original, mask, overlay, and debug images. The session file `configs/manual_tuning_session.json` records saved sample frame numbers and notes for future auto-tuning.
+
+This mode does not train anything, does not use machine learning, and does not control the QCar2. The future optimizer should use `configs/manual_tuned_config.json` as its starting point instead of searching randomly.
+
 ## Controls
 
 - `q` or `ESC`: quit

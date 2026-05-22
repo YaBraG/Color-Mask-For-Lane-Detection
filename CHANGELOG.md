@@ -4,6 +4,43 @@
 
 Files changed:
 
+- `main.py`
+- `README.md`
+- `CHANGELOG.md`
+
+Summary:
+
+- Added manual video tuning mode with `--tune-video` for pausing recorded QCar2 video, adjusting HSV/mask trackbars, and saving a baseline config.
+- Added `--config-output`, `--session-output`, `--start-frame`, and `--playback-speed` for manual tuning sessions.
+- Added tuning keyboard controls for pause/play, frame stepping, config save/load/reset, candidate/mask toggles, playback speed, and good/difficult/debug sample capture.
+- Added a video frame control trackbar for jumping through the recorded video.
+
+Why:
+
+- The detector needs a human-tuned baseline on difficult recorded frames before building a full self-tuning optimizer.
+- The future optimizer should search around a known useful manual config instead of starting randomly.
+
+Output files/folders added:
+
+- `configs/manual_tuned_config.json`
+- `configs/manual_tuning_session.json`
+- `outputs/manual_tuning/good_samples/`
+- `outputs/manual_tuning/difficult_samples/`
+- `outputs/manual_tuning/debug_snapshots/`
+
+Known limitations:
+
+- Manual tuning is interactive and requires OpenCV display windows, so it is not suitable for headless validation.
+- It still uses RGB/OpenCV/NumPy only; no machine learning, reinforcement learning, ROS2, or depth processing is involved.
+
+Follow-up work:
+
+- Use `configs/manual_tuned_config.json` as the seed for auto-tuning.
+
+## 2026-05-22
+
+Files changed:
+
 - `config.py`
 - `main.py`
 - `README.md`

@@ -1,0 +1,27 @@
+{
+  "source_video": "assets\\test_video.mp4",
+  "last_saved_frame_index": 0,
+  "config_output_path": "configs\\manual_tuned_config.json",
+  "good_sample_frames": [
+    0
+  ],
+  "difficult_sample_frames": [
+    0
+  ],
+  "debug_snapshot_frames": [
+    0
+  ],
+  "final_config": {
+    "H_min": 0,
+    "H_max": 179,
+    "S_min": 0,
+    "S_max": 80,
+    "V_min": 20,
+    "V_max": 120,
+    "ROI_top_percent": 58,
+    "Morph_kernel": 5,
+    "Close_kernel": 0,
+    "Min_area_percent": 3
+  },
+  "notes_for_auto_tuning": "This config should be used as the center/seed for the future auto-tuning search. Auto-tuning should explore small ranges around these values first."
+}
