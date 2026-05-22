@@ -4,6 +4,31 @@
 
 Files changed:
 
+- `config.py`
+- `main.py`
+- `README.md`
+- `CHANGELOG.md`
+
+Summary:
+
+- Added ego-connected road mask filtering so the detector keeps the white road component connected to the bottom-center/front-of-car area.
+- Added ego seed/search config values for seed position, search radius, bottom-band preference, and minimum connected component area.
+- Added telemetry and debug visualization for ego seed point, selected anchor point, component area, and fallback use.
+- Updated video frame samples to include both raw HSV masks and ego-connected masks.
+- Added `e` in manual video tuning mode to toggle ego-connected filtering for comparison.
+
+Why ego-connected road filtering was added:
+
+- HSV can detect parking lots, side roads, and other road-colored blobs. The centerline tracker should follow the component closest to the vehicle instead of being pulled toward disconnected side areas.
+
+Known limitation:
+
+- If the side area is physically connected to the main road, ego filtering alone may not fully reject it; centerline continuity and map/path guidance are still needed.
+
+## 2026-05-22
+
+Files changed:
+
 - `main.py`
 - `README.md`
 - `CHANGELOG.md`

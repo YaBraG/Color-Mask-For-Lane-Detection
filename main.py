@@ -24,6 +24,11 @@ from config import (
     CURVE_DEADBAND_PX,
     CURVE_STRONG_PX,
     DEFAULT_SETTINGS,
+    EGO_BOTTOM_BAND_PERCENT,
+    EGO_MIN_COMPONENT_AREA_PERCENT,
+    EGO_SEED_SEARCH_RADIUS_PX,
+    EGO_SEED_X_RATIO,
+    EGO_SEED_Y_RATIO,
     FRAME_HEIGHT,
     FRAME_WIDTH,
     LAST_CENTER_HOLD_FRAMES,
@@ -36,6 +41,7 @@ from config import (
     SELECT_CONFIDENCE,
     SELECT_MARGIN,
     TRACKBAR_RANGES,
+    USE_EGO_CONNECTED_MASK,
     WINDOW_MAIN,
     WINDOW_MASK,
     WINDOW_TUNING,
@@ -59,6 +65,7 @@ OPTIONAL_TRACKBAR_RANGES = {
 
 @dataclass
 class RoadResult:
+    raw_mask: np.ndarray
     mask: np.ndarray
     road_detected: bool
     road_confidence: float
@@ -74,6 +81,14 @@ class RoadResult:
     seed_center_x: float
     first_anchor_x: float | None
     first_anchor_distance_px: float | None
+    ego_component_found: bool
+    ego_seed_x: int
+    ego_seed_y: int
+    ego_anchor_x: int | None
+    ego_anchor_y: int | None
+    ego_component_area_pixels: int
+    ego_component_area_percent: float
+    ego_component_fallback_used: bool
     scan_points: list[tuple[int, int, int, int]]
     boundary_points: list[tuple[int, int]]
 
@@ -403,7 +418,7 @@ def clamp(value, minimum, maximum):
     return min(max(value, minimum), maximum)
 
 
-def detect_road(frame, settings, last_center_x, frames_since_valid):
+def detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_connected_mask=None):
     height, width = frame.shape[:2]
     roi_top = int(height * settings["ROI_top_percent"] / 100.0)
 
@@ -426,7 +441,8 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
         close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kernel_size, close_kernel_size))
         full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_CLOSE, close_kernel)
 
-    mask = keep_relevant_component(full_mask, settings)
+    raw_mask = full_mask.copy()
+    mask, ego_debug = keep_relevant_component(full_mask, settings, use_ego_connected_mask)
     area = int(cv2.countNonZero(mask))
     roi_area = max(1, width * (height - roi_top))
     min_area = roi_area * settings["Min_area_percent"] / 100.0
@@ -482,6 +498,7 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
         road_center_error_px = road_center_x - (width / 2.0)
 
     return RoadResult(
+        raw_mask=raw_mask,
         mask=mask,
         road_detected=road_detected,
         road_confidence=road_confidence,
@@ -497,12 +514,123 @@ def detect_road(frame, settings, last_center_x, frames_since_valid):
         seed_center_x=seed_center_x,
         first_anchor_x=first_anchor_x,
         first_anchor_distance_px=first_anchor_distance_px,
+        ego_component_found=ego_debug["ego_component_found"],
+        ego_seed_x=ego_debug["ego_seed_x"],
+        ego_seed_y=ego_debug["ego_seed_y"],
+        ego_anchor_x=ego_debug["ego_anchor_x"],
+        ego_anchor_y=ego_debug["ego_anchor_y"],
+        ego_component_area_pixels=ego_debug["ego_component_area_pixels"],
+        ego_component_area_percent=ego_debug["ego_component_area_percent"],
+        ego_component_fallback_used=ego_debug["ego_component_fallback_used"],
         scan_points=scan_points,
         boundary_points=boundary_points,
     )
 
 
-def keep_relevant_component(mask, settings):
+def make_ego_debug(mask, found=False, anchor_x=None, anchor_y=None, area_pixels=0, fallback_used=False):
+    height, width = mask.shape[:2]
+    seed_x = int(round(width * EGO_SEED_X_RATIO))
+    seed_y = int(round(height * EGO_SEED_Y_RATIO))
+    seed_x = min(max(0, seed_x), width - 1)
+    seed_y = min(max(0, seed_y), height - 1)
+    return {
+        "ego_component_found": bool(found),
+        "ego_seed_x": seed_x,
+        "ego_seed_y": seed_y,
+        "ego_anchor_x": anchor_x,
+        "ego_anchor_y": anchor_y,
+        "ego_component_area_pixels": int(area_pixels),
+        "ego_component_area_percent": area_pixels / max(1, width * height) * 100.0,
+        "ego_component_fallback_used": bool(fallback_used),
+    }
+
+
+def select_ego_connected_component(mask, settings):
+    # HSV sees every road-colored pixel. This filter keeps only the white
+    # component connected to the ego/start area near the bottom-center, where
+    # the car's immediate drivable road should appear in the camera image.
+    height, width = mask.shape[:2]
+    seed_x = int(round(width * EGO_SEED_X_RATIO))
+    seed_y = int(round(height * EGO_SEED_Y_RATIO))
+    seed_x = min(max(0, seed_x), width - 1)
+    seed_y = min(max(0, seed_y), height - 1)
+
+    anchor = None
+    if mask[seed_y, seed_x] > 0:
+        anchor = (seed_x, seed_y)
+    else:
+        anchor = find_nearest_ego_anchor(mask, seed_x, seed_y)
+
+    if anchor is None:
+        return None, make_ego_debug(mask)
+
+    num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    anchor_x, anchor_y = anchor
+    label = labels[anchor_y, anchor_x]
+    if label <= 0 or label >= num_labels:
+        return None, make_ego_debug(mask)
+
+    area_pixels = int(stats[label, cv2.CC_STAT_AREA])
+    min_area = width * height * EGO_MIN_COMPONENT_AREA_PERCENT / 100.0
+    if area_pixels < min_area:
+        return None, make_ego_debug(mask)
+
+    selected = np.where(labels == label, 255, 0).astype(np.uint8)
+    debug = make_ego_debug(mask, True, int(anchor_x), int(anchor_y), area_pixels, False)
+    return selected, debug
+
+
+def find_nearest_ego_anchor(mask, seed_x, seed_y):
+    height, width = mask.shape[:2]
+    radius = max(1, int(EGO_SEED_SEARCH_RADIUS_PX))
+    x1 = max(0, seed_x - radius)
+    x2 = min(width - 1, seed_x + radius)
+    y1 = max(0, seed_y - radius)
+    y2 = min(height - 1, seed_y + radius)
+    search = mask[y1 : y2 + 1, x1 : x2 + 1]
+    points = cv2.findNonZero(search)
+    if points is None:
+        return None
+
+    bottom_band_y = int(height * (1.0 - EGO_BOTTOM_BAND_PERCENT / 100.0))
+    best_score = None
+    best_anchor = None
+    for point in points.reshape(-1, 2):
+        x = int(point[0]) + x1
+        y = int(point[1]) + y1
+        dx = x - seed_x
+        dy = y - seed_y
+        distance = (dx * dx + dy * dy) ** 0.5
+        if distance > radius:
+            continue
+        # Lower pixels are closer to the vehicle. Give them a small bonus so
+        # a nearby side blob higher in the image is less likely to become the
+        # ego anchor.
+        bottom_bonus = 35.0 if y >= bottom_band_y else 0.0
+        score = distance - bottom_bonus
+        if best_score is None or score < best_score:
+            best_score = score
+            best_anchor = (x, y)
+    return best_anchor
+
+
+def keep_relevant_component(mask, settings, use_ego_connected_mask=None):
+    if use_ego_connected_mask is None:
+        use_ego_connected_mask = USE_EGO_CONNECTED_MASK
+
+    if use_ego_connected_mask:
+        ego_mask, ego_debug = select_ego_connected_component(mask, settings)
+        if ego_mask is not None:
+            return ego_mask, ego_debug
+    else:
+        ego_debug = make_ego_debug(mask)
+
+    fallback_mask = keep_relevant_component_by_score(mask, settings)
+    ego_debug["ego_component_fallback_used"] = True
+    return fallback_mask, ego_debug
+
+
+def keep_relevant_component_by_score(mask, settings):
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if num_labels <= 1:
         return mask
@@ -698,10 +826,29 @@ def draw_visualization(frame, result, confidences, selected_path, smoothed_curve
         draw_candidate_paths(output, confidences, selected_path)
 
     draw_detected_centerline(output, result)
+    draw_ego_anchor_debug(output, result)
     cv2.line(output, (width // 2, height), (width // 2, int(height * 0.45)), (255, 255, 255), 1)
 
     draw_debug_text(output, result, confidences, selected_path, smoothed_curve_error_px, turn_hint)
     return output
+
+
+def draw_ego_anchor_debug(output, result):
+    # White marks the expected ego seed near the front/bottom of the image.
+    # Cyan/magenta marks the actual white road pixel used to choose the
+    # connected component, which makes side-blob mistakes easy to inspect.
+    cv2.circle(output, (int(result.ego_seed_x), int(result.ego_seed_y)), 6, (255, 255, 255), 2)
+    if result.ego_anchor_x is not None and result.ego_anchor_y is not None:
+        color = (255, 0, 255) if result.ego_component_fallback_used else (255, 255, 0)
+        cv2.circle(output, (int(result.ego_anchor_x), int(result.ego_anchor_y)), 6, color, -1)
+        cv2.line(
+            output,
+            (int(result.ego_seed_x), int(result.ego_seed_y)),
+            (int(result.ego_anchor_x), int(result.ego_anchor_y)),
+            color,
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def draw_candidate_paths(output, confidences, selected_path):
@@ -767,6 +914,9 @@ def draw_debug_text(output, result, confidences, selected_path, smoothed_curve_e
         f"far_center_x: {far_text}",
         f"tracked_center_valid: {result.tracked_center_valid}",
         f"rejected_scanlines: {result.rejected_scanlines}",
+        f"ego_found: {result.ego_component_found}",
+        f"ego_area_pct: {result.ego_component_area_percent:.2f}",
+        f"ego_fallback: {result.ego_component_fallback_used}",
         f"selected_path: {selected_path}",
         f"straight_confidence: {confidences['straight']:.2f}",
         f"left_confidence: {confidences['left']:.2f}",
@@ -1030,6 +1180,12 @@ def get_config_used(settings, config_source=None):
         "MIN_SEGMENT_WIDTH_PX": MIN_SEGMENT_WIDTH_PX,
         "MAX_CENTER_JUMP_PX": MAX_CENTER_JUMP_PX,
         "ALLOW_FIRST_ANCHOR_JUMP": ALLOW_FIRST_ANCHOR_JUMP,
+        "USE_EGO_CONNECTED_MASK": USE_EGO_CONNECTED_MASK,
+        "EGO_SEED_X_RATIO": EGO_SEED_X_RATIO,
+        "EGO_SEED_Y_RATIO": EGO_SEED_Y_RATIO,
+        "EGO_SEED_SEARCH_RADIUS_PX": EGO_SEED_SEARCH_RADIUS_PX,
+        "EGO_BOTTOM_BAND_PERCENT": EGO_BOTTOM_BAND_PERCENT,
+        "EGO_MIN_COMPONENT_AREA_PERCENT": EGO_MIN_COMPONENT_AREA_PERCENT,
         "CENTERLINE_SMOOTHING_ALPHA": CENTERLINE_SMOOTHING_ALPHA,
         "CURVE_DEADBAND_PX": CURVE_DEADBAND_PX,
         "CURVE_STRONG_PX": CURVE_STRONG_PX,
@@ -1095,6 +1251,14 @@ def build_telemetry_row(frame_index, time_sec, result, confidences, selected_pat
         "seed_center_x": f"{result.seed_center_x:.2f}",
         "first_anchor_x": safe_number(result.first_anchor_x),
         "first_anchor_distance_px": safe_number(result.first_anchor_distance_px),
+        "ego_component_found": result.ego_component_found,
+        "ego_seed_x": result.ego_seed_x,
+        "ego_seed_y": result.ego_seed_y,
+        "ego_anchor_x": safe_number(result.ego_anchor_x),
+        "ego_anchor_y": safe_number(result.ego_anchor_y),
+        "ego_component_area_pixels": result.ego_component_area_pixels,
+        "ego_component_area_percent": f"{result.ego_component_area_percent:.4f}",
+        "ego_component_fallback_used": result.ego_component_fallback_used,
         "selected_path": selected_path,
         "straight_confidence": f"{confidences['straight']:.4f}",
         "left_confidence": f"{confidences['left']:.4f}",
@@ -1215,7 +1379,8 @@ def save_periodic_ai_samples(frame, result, overlay, debug_frame, folder, frame_
         return next_sample_time
 
     cv2.imwrite(str(folder / f"frame_{frame_index:06d}_original.jpg"), frame)
-    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_mask.jpg"), result.mask)
+    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_raw_mask.jpg"), result.raw_mask)
+    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_ego_mask.jpg"), result.mask)
     cv2.imwrite(str(folder / f"frame_{frame_index:06d}_overlay.jpg"), overlay)
     cv2.imwrite(str(folder / f"frame_{frame_index:06d}_debug.jpg"), debug_frame)
     return next_sample_time + interval_sec
@@ -1369,7 +1534,7 @@ def write_run_notes(path, args, folders):
         "- events CSV: only important changes such as road loss, low confidence, jumps, and path changes.",
         "- summary AI JSON: structured run summary and grouped problem intervals.",
         "- config used JSON: exact HSV/ROI/math thresholds used for the run.",
-        "- frame_samples: periodic original/mask/overlay/debug images.",
+        "- frame_samples: periodic original/raw_mask/ego_mask/overlay/debug images.",
         "- failure_frames: suspicious debug frames, capped by command-line settings.",
         "",
         "Known limitations:",
@@ -1483,12 +1648,14 @@ def process_video_tuning_mode(args):
     paused = False
     show_mask_window = False
     show_candidates = True
+    use_ego_connected_mask = USE_EGO_CONNECTED_MASK
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
     tracker = PathConfidenceTracker()
 
     print("Manual video tuning controls:")
     print("q/ESC quit | p/SPACE pause | s save config | l load config-output | r reset")
+    print("e toggle ego-connected mask | m mask window | c candidate paths")
     print("g good sample | f difficult sample | d debug snapshot | n/right next | b/left back")
 
     try:
@@ -1506,7 +1673,7 @@ def process_video_tuning_mode(args):
 
             frame = resize_frame(frame)
             settings = get_trackbar_settings()
-            result = detect_road(frame, settings, last_center_x, frames_since_valid)
+            result = detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_connected_mask)
             if result.road_detected and result.road_center_x is not None:
                 last_center_x = result.road_center_x
                 frames_since_valid = 0
@@ -1531,7 +1698,7 @@ def process_video_tuning_mode(args):
             display = build_display_grid(frame, result, debug_frame)
             cv2.putText(
                 display,
-                f"Frame {current_frame_index}/{max(0, total_frames - 1)}  speed {playback_speed:.1f}x",
+                f"Frame {current_frame_index}/{max(0, total_frames - 1)}  speed {playback_speed:.1f}x  ego_filter {use_ego_connected_mask}",
                 (12, FRAME_HEIGHT - 14),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.62,
@@ -1583,6 +1750,11 @@ def process_video_tuning_mode(args):
                 print("Reset tuning settings to DEFAULT_SETTINGS.")
             elif key == ord("m"):
                 show_mask_window = not show_mask_window
+            elif key == ord("e"):
+                use_ego_connected_mask = not use_ego_connected_mask
+                last_center_x = None
+                frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
+                print(f"Ego-connected mask {'on' if use_ego_connected_mask else 'off'}.")
             elif key == ord("c"):
                 show_candidates = not show_candidates
             elif key in (ord("n"), 83, 2555904):
@@ -1689,6 +1861,14 @@ def process_video_source(args):
         "seed_center_x",
         "first_anchor_x",
         "first_anchor_distance_px",
+        "ego_component_found",
+        "ego_seed_x",
+        "ego_seed_y",
+        "ego_anchor_x",
+        "ego_anchor_y",
+        "ego_component_area_pixels",
+        "ego_component_area_percent",
+        "ego_component_fallback_used",
         "selected_path",
         "straight_confidence",
         "left_confidence",

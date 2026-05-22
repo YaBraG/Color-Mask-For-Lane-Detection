@@ -105,6 +105,16 @@ Files to upload to ChatGPT for analysis:
 
 The annotated video is best for human visual inspection. The CSV, JSON, frame samples, and failure frames are better for AI debugging because they preserve the detector's numeric state and selected visual evidence. The local file `assets/test_video.mp4` is intentionally not committed and is ignored by git because it is large.
 
+## Ego-Connected Road Mask
+
+HSV thresholding detects every road-colored pixel in the frame. That can include parking lots, side roads, or disconnected dark areas that look like the road but are not the road directly in front of the QCar2.
+
+The ego-connected mask keeps only the white road component connected to the bottom-center/front area of the image. The seed point is near the lower center of the frame, and if that exact pixel is black, the detector searches nearby for the closest white road pixel, preferring pixels in the bottom band because they are closer to the car.
+
+This filtered mask is what centerline tracking uses, so disconnected side-road blobs should not affect scanline centers, `road_center_error_px`, `curve_error_px`, `turn_hint`, or path confidences. Video samples now include both `frame_XXXXXX_raw_mask.jpg` and `frame_XXXXXX_ego_mask.jpg` so the raw HSV result can be compared with the driving/path-extraction mask.
+
+If a side area is physically connected to the main road, ego filtering alone may still include it. The scanline tracker still enforces centerline continuity with `MAX_CENTER_JUMP_PX` after the first anchor, but future map/path guidance may be needed for complex connected branches.
+
 ## Manual Video Tuning Mode
 
 Manual video tuning plays a recorded QCar2 ride with the same 2x2 display used by the detector: original RGB, road mask, road overlay, and detected center path/debug view. It is for finding a good RGB/OpenCV/NumPy baseline config before building the future auto-tuning optimizer.
@@ -139,6 +149,7 @@ Useful keys:
 - `s`: save `configs/manual_tuned_config.json`
 - `l`: load from `--config-output`
 - `r`: reset to `DEFAULT_SETTINGS`
+- `e`: toggle ego-connected mask filtering for comparison
 - `n` or right arrow: step forward while paused
 - `b` or left arrow: step backward
 - `g`: save a good tuning sample
