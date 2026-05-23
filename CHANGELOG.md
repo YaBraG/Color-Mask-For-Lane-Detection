@@ -12,6 +12,33 @@ Files changed:
 
 Summary:
 
+- Fixed safe-corridor steering math to use the selected lane segment center relative to a tunable camera/car reference point.
+- Added camera center offset config values for future CSI camera alignment tuning.
+- Recomputed left/right clearances from car half-width so centered clearance matches the physical lane/car dimensions.
+- Added physical sanity gates for negative clearance, unreasonable corridor error, and unreasonable clearance.
+- Added steering saturation protection so the visual helper shuts off instead of commanding hard correction for too many consecutive frames.
+- Added telemetry/debug fields for ego reference, lane center, side spaces, unphysical geometry, and saturation count.
+
+Known limitation:
+
+- This still uses row-local lane-width scaling, not full camera calibration or homography.
+
+Follow-up work:
+
+- Tune camera center offset on measured CSI camera mounting and validate before connecting `visual_steering_correction` to the QCar controller.
+
+## 2026-05-23
+
+Files changed:
+
+- `config.py`
+- `main.py`
+- `auto_tuner.py`
+- `README.md`
+- `CHANGELOG.md`
+
+Summary:
+
 - Added forced right-lane yellow lock for safe-corridor scanlines.
 - When yellow is visible, the safe corridor now uses the road segment immediately to the right of the yellow boundary and ignores left-lane road segments.
 - Added lane-side hold behavior for the right-lane lock so selected side does not flicker when yellow briefly disappears.

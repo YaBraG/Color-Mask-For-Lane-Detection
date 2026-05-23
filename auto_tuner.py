@@ -58,6 +58,13 @@ from config import (
     NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO,
     NO_YELLOW_MAX_MEASURED_WIDTH_MM,
     ALLOW_NO_YELLOW_BLOB_SPLIT,
+    CAMERA_CENTER_X_RATIO,
+    CAMERA_CENTER_OFFSET_PX,
+    CAMERA_CENTER_OFFSET_MM,
+    MIN_CLEARANCE_MM,
+    MAX_REASONABLE_CORRIDOR_ERROR_MM,
+    MAX_REASONABLE_CLEARANCE_MM,
+    MAX_STEERING_SATURATION_FRAMES,
     LAST_CENTER_HOLD_FRAMES,
     MAX_CENTER_JUMP_PX,
     MIN_SEGMENT_WIDTH_PX,
@@ -218,6 +225,13 @@ def normalize_config(config):
         "NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO": NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO,
         "NO_YELLOW_MAX_MEASURED_WIDTH_MM": NO_YELLOW_MAX_MEASURED_WIDTH_MM,
         "ALLOW_NO_YELLOW_BLOB_SPLIT": ALLOW_NO_YELLOW_BLOB_SPLIT,
+        "CAMERA_CENTER_X_RATIO": CAMERA_CENTER_X_RATIO,
+        "CAMERA_CENTER_OFFSET_PX": CAMERA_CENTER_OFFSET_PX,
+        "CAMERA_CENTER_OFFSET_MM": CAMERA_CENTER_OFFSET_MM,
+        "MIN_CLEARANCE_MM": MIN_CLEARANCE_MM,
+        "MAX_REASONABLE_CORRIDOR_ERROR_MM": MAX_REASONABLE_CORRIDOR_ERROR_MM,
+        "MAX_REASONABLE_CLEARANCE_MM": MAX_REASONABLE_CLEARANCE_MM,
+        "MAX_STEERING_SATURATION_FRAMES": MAX_STEERING_SATURATION_FRAMES,
     }
     for key in merged:
         if key in config:
@@ -379,6 +393,7 @@ def evaluate_config_on_frames(frames, source_fps, config):
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
     lane_side_memory = {}
+    safe_corridor_state = {}
     previous_turn_hint = "unknown"
     for frame_index, time_sec, frame in frames:
         result = app.detect_road(
@@ -388,6 +403,7 @@ def evaluate_config_on_frames(frames, source_fps, config):
             frames_since_valid,
             detector_config=config,
             lane_side_memory=lane_side_memory,
+            safe_corridor_state=safe_corridor_state,
         )
         if result.road_detected and result.road_center_x is not None:
             last_center_x = result.road_center_x
@@ -481,7 +497,10 @@ def render_best_config_video(video_path, config, folders, source_fps):
         "yellow_boundary_pixel_count", "yellow_boundary_enforced", "selected_lane_side",
         "yellow_crossing_pixels", "yellow_right_edge_x", "right_lane_segment_found",
         "right_lane_segment_left_x", "right_lane_segment_right_x", "right_lane_segment_width_px",
-        "right_lane_lock_active", "right_lane_lock_reason", "straight_confidence", "left_confidence", "right_confidence", "mask_area_pixels",
+        "right_lane_lock_active", "right_lane_lock_reason", "ego_reference_x",
+        "camera_center_offset_px", "lane_center_x", "left_space_mm", "right_space_mm",
+        "unphysical_corridor_geometry", "steering_saturation_count",
+        "straight_confidence", "left_confidence", "right_confidence", "mask_area_pixels",
         "mask_area_percent", "centerline_point_count", "processing_fps_estimate",
     ]
     event_fields = ["frame_index", "time_sec", "event_type", "old_value", "new_value", "notes"]
@@ -490,6 +509,7 @@ def render_best_config_video(video_path, config, folders, source_fps):
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
     lane_side_memory = {}
+    safe_corridor_state = {}
     previous_state = None
     next_sample_time = 0.0
     failure_count = 0
@@ -517,6 +537,7 @@ def render_best_config_video(video_path, config, folders, source_fps):
                     frames_since_valid,
                     detector_config=config,
                     lane_side_memory=lane_side_memory,
+                    safe_corridor_state=safe_corridor_state,
                 )
                 if result.road_detected and result.road_center_x is not None:
                     last_center_x = result.road_center_x

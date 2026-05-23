@@ -134,6 +134,10 @@ The safe hallway width is the car width plus a `12 mm` sidewalk margin and a `12
 
 The helper only activates when the local corridor appears physically valid. If the measured lane is too narrow, too wide, low-confidence, missing ego connection, or has too few usable lower scanlines, `safe_corridor_valid = False`, `visual_helper_active = False`, and `visual_steering_correction = 0`. In those wide or ambiguous areas, the normal controller is expected to remain in charge.
 
+The steering helper uses the selected lane segment center relative to the camera/car reference point. By default the reference is image center, but `CAMERA_CENTER_X_RATIO`, `CAMERA_CENTER_OFFSET_PX`, and `CAMERA_CENTER_OFFSET_MM` can be tuned later if the CSI camera is physically offset.
+
+The geometry must stay physically believable. Since the lane is `254 mm` and the car is `203.2 mm`, centered clearance is only about `25.4 mm` per side. Negative clearances, huge corridor-center errors, or excessive clearance values make the helper turn off with `safe_corridor_reason = "unphysical_corridor_geometry"`. If steering stays saturated for too many consecutive frames, the helper also turns off with `safe_corridor_reason = "steering_saturated_too_long"`.
+
 The older candidate arrows are now secondary debug hints. The primary local steering helper output is the blue safe corridor plus `corridor_center_error_mm` and `visual_steering_correction`.
 
 ## Yellow Boundary Lock

@@ -68,6 +68,13 @@ from config import (
     NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO,
     NO_YELLOW_MAX_MEASURED_WIDTH_MM,
     ALLOW_NO_YELLOW_BLOB_SPLIT,
+    CAMERA_CENTER_X_RATIO,
+    CAMERA_CENTER_OFFSET_PX,
+    CAMERA_CENTER_OFFSET_MM,
+    MIN_CLEARANCE_MM,
+    MAX_REASONABLE_CORRIDOR_ERROR_MM,
+    MAX_REASONABLE_CLEARANCE_MM,
+    MAX_STEERING_SATURATION_FRAMES,
     MAX_CENTER_JUMP_PX,
     MIN_SEGMENT_WIDTH_PX,
     REALSENSE_FPS,
@@ -153,6 +160,13 @@ class RoadResult:
     right_lane_segment_width_px: float | None
     right_lane_lock_active: bool
     right_lane_lock_reason: str
+    ego_reference_x: float
+    camera_center_offset_px: float
+    lane_center_x: float | None
+    left_space_mm: float | None
+    right_space_mm: float | None
+    unphysical_corridor_geometry: bool
+    steering_saturation_count: int
     scan_points: list[tuple[int, int, int, int]]
     boundary_points: list[tuple[int, int]]
 
@@ -656,6 +670,7 @@ def detect_road(
     detector_config=None,
     use_yellow_boundary_lock=None,
     lane_side_memory=None,
+    safe_corridor_state=None,
 ):
     height, width = frame.shape[:2]
     roi_top = int(height * settings["ROI_top_percent"] / 100.0)
@@ -737,6 +752,7 @@ def detect_road(
         use_yellow_boundary_lock,
         selected_lane_side,
     )
+    apply_steering_saturation_gate(safe_corridor, safe_corridor_state, detector_config)
     if right_lane_lock_enabled:
         selected_lane_side = update_right_lane_memory(
             yellow_visible,
@@ -824,6 +840,13 @@ def detect_road(
         right_lane_segment_width_px=safe_corridor["right_lane_segment_width_px"],
         right_lane_lock_active=safe_corridor["right_lane_lock_active"],
         right_lane_lock_reason=safe_corridor["right_lane_lock_reason"],
+        ego_reference_x=safe_corridor["ego_reference_x"],
+        camera_center_offset_px=safe_corridor["camera_center_offset_px"],
+        lane_center_x=safe_corridor["lane_center_x"],
+        left_space_mm=safe_corridor["left_space_mm"],
+        right_space_mm=safe_corridor["right_space_mm"],
+        unphysical_corridor_geometry=safe_corridor["unphysical_corridor_geometry"],
+        steering_saturation_count=safe_corridor["steering_saturation_count"],
         scan_points=scan_points,
         boundary_points=boundary_points,
     )
@@ -988,7 +1011,11 @@ def estimate_safe_corridor(
     # nearby/lower road edges to estimate a lane-like hallway that the QCar2
     # can fit through without touching sidewalk or line margins.
     height, width = mask.shape[:2]
-    image_center_x = width / 2.0
+    camera_center_offset_px = cfg_float(detector_config, "CAMERA_CENTER_OFFSET_PX", CAMERA_CENTER_OFFSET_PX)
+    ego_reference_x = (
+        width * cfg_float(detector_config, "CAMERA_CENTER_X_RATIO", CAMERA_CENTER_X_RATIO)
+        + camera_center_offset_px
+    )
     rows = np.linspace(
         int(height * cfg_float(detector_config, "SAFE_SCANLINE_END_RATIO", SAFE_SCANLINE_END_RATIO)),
         int(height * cfg_float(detector_config, "SAFE_SCANLINE_START_RATIO", SAFE_SCANLINE_START_RATIO)),
@@ -1028,7 +1055,7 @@ def estimate_safe_corridor(
             if use_right_lane_lock and yellow_right_edge_x is not None:
                 right_lane_lock_reason = "yellow_visible_no_right_segment"
                 continue
-            selected_segment = min(segments, key=lambda segment: abs(segment[2] - image_center_x))
+        selected_segment = min(segments, key=lambda segment: abs(segment[2] - ego_reference_x))
         left_x, right_x, segment_center_x = selected_segment
         lane_width_px = max(1.0, float(right_x - left_x))
         safe_rows.append(
@@ -1065,43 +1092,58 @@ def estimate_safe_corridor(
     lane_width_mm_values = []
     left_clearances = []
     right_clearances = []
+    left_spaces = []
+    right_spaces = []
     center_errors_mm = []
     center_errors_px = []
+    lane_centers_x = []
     safe_width_px_values = []
     safe_width_mm = cfg_float(detector_config, "SAFE_HALLWAY_WIDTH_MM", SAFE_HALLWAY_WIDTH_MM)
     lane_width_mm = cfg_float(detector_config, "LANE_WIDTH_MM", LANE_WIDTH_MM)
+    car_half_width_mm = cfg_float(detector_config, "CAR_WIDTH_MM", CAR_WIDTH_MM) / 2.0
 
     for row in safe_rows:
         # Row-local scale is intentionally simple: the detected lane width at
         # this row maps to the known physical lane width. This avoids full
         # camera calibration/homography while still producing useful mm values.
         local_mm_per_px = lane_width_mm / max(1.0, row["lane_width_px"])
-        reference_mm_per_px = lane_width_mm / reference_width_px
-        measured_lane_width_mm = row["lane_width_px"] * reference_mm_per_px
-        left_clearance_mm = (image_center_x - row["left_x"]) * local_mm_per_px - (safe_width_mm / 2.0)
-        right_clearance_mm = (row["right_x"] - image_center_x) * local_mm_per_px - (safe_width_mm / 2.0)
-        corridor_error_mm = right_clearance_mm - left_clearance_mm
-        corridor_error_px = row["center_x"] - image_center_x
+        measured_lane_width_mm = row["lane_width_px"] * local_mm_per_px
+        lane_center_x = (row["left_x"] + row["right_x"]) / 2.0
+        corridor_error_px = lane_center_x - ego_reference_x
+        corridor_error_mm = corridor_error_px * local_mm_per_px + cfg_float(detector_config, "CAMERA_CENTER_OFFSET_MM", CAMERA_CENTER_OFFSET_MM)
+        left_space_mm = (ego_reference_x - row["left_x"]) * local_mm_per_px
+        right_space_mm = (row["right_x"] - ego_reference_x) * local_mm_per_px
+        left_clearance_mm = left_space_mm - car_half_width_mm
+        right_clearance_mm = right_space_mm - car_half_width_mm
         row["mm_per_px"] = local_mm_per_px
-        row["safe_left_x"] = row["center_x"] - (safe_width_mm / local_mm_per_px / 2.0)
-        row["safe_right_x"] = row["center_x"] + (safe_width_mm / local_mm_per_px / 2.0)
+        row["lane_center_x"] = lane_center_x
+        row["safe_left_x"] = lane_center_x - (safe_width_mm / local_mm_per_px / 2.0)
+        row["safe_right_x"] = lane_center_x + (safe_width_mm / local_mm_per_px / 2.0)
         row["measured_lane_width_mm"] = measured_lane_width_mm
+        row["left_space_mm"] = left_space_mm
+        row["right_space_mm"] = right_space_mm
         row["left_clearance_mm"] = left_clearance_mm
         row["right_clearance_mm"] = right_clearance_mm
         row["corridor_error_mm"] = corridor_error_mm
         lane_width_mm_values.append(measured_lane_width_mm)
+        left_spaces.append(left_space_mm)
+        right_spaces.append(right_space_mm)
         left_clearances.append(left_clearance_mm)
         right_clearances.append(right_clearance_mm)
         center_errors_mm.append(corridor_error_mm)
         center_errors_px.append(corridor_error_px)
+        lane_centers_x.append(lane_center_x)
         safe_width_px_values.append(safe_width_mm / local_mm_per_px)
 
     measured_lane_width_mm = float(np.average(lane_width_mm_values, weights=weights))
     measured_lane_width_px = float(np.average(widths_px, weights=weights))
     left_clearance_mm = float(np.average(left_clearances, weights=weights))
     right_clearance_mm = float(np.average(right_clearances, weights=weights))
+    left_space_mm = float(np.average(left_spaces, weights=weights))
+    right_space_mm = float(np.average(right_spaces, weights=weights))
     corridor_center_error_mm = float(np.average(center_errors_mm, weights=weights))
     corridor_center_error_px = float(np.average(center_errors_px, weights=weights))
+    lane_center_x = float(np.average(lane_centers_x, weights=weights))
     safe_width_px = float(np.average(safe_width_px_values, weights=weights))
 
     min_width = cfg_float(detector_config, "MIN_VALID_LANE_WIDTH_MM", MIN_VALID_LANE_WIDTH_MM)
@@ -1122,6 +1164,13 @@ def estimate_safe_corridor(
             or measured_lane_width_mm > cfg_float(detector_config, "NO_YELLOW_MAX_MEASURED_WIDTH_MM", NO_YELLOW_MAX_MEASURED_WIDTH_MM)
         )
     )
+    unphysical_corridor_geometry = (
+        left_clearance_mm < cfg_float(detector_config, "MIN_CLEARANCE_MM", MIN_CLEARANCE_MM)
+        or right_clearance_mm < cfg_float(detector_config, "MIN_CLEARANCE_MM", MIN_CLEARANCE_MM)
+        or abs(corridor_center_error_mm) > cfg_float(detector_config, "MAX_REASONABLE_CORRIDOR_ERROR_MM", MAX_REASONABLE_CORRIDOR_ERROR_MM)
+        or abs(left_clearance_mm) > cfg_float(detector_config, "MAX_REASONABLE_CLEARANCE_MM", MAX_REASONABLE_CLEARANCE_MM)
+        or abs(right_clearance_mm) > cfg_float(detector_config, "MAX_REASONABLE_CLEARANCE_MM", MAX_REASONABLE_CLEARANCE_MM)
+    )
     reason = "valid"
     if not ego_debug["ego_component_found"]:
         reason = "ego_component_missing"
@@ -1138,6 +1187,8 @@ def estimate_safe_corridor(
         reason = "crosses_yellow_boundary"
     elif wide_blob_no_yellow:
         reason = "wide_blob_no_yellow"
+    elif unphysical_corridor_geometry:
+        reason = "unphysical_corridor_geometry"
     elif measured_lane_width_mm < min_width:
         reason = "too_narrow"
     elif measured_lane_width_mm > max_width:
@@ -1161,6 +1212,8 @@ def estimate_safe_corridor(
         "lane_width_valid": lane_width_valid,
         "left_clearance_mm": left_clearance_mm,
         "right_clearance_mm": right_clearance_mm,
+        "left_space_mm": left_space_mm,
+        "right_space_mm": right_space_mm,
         "corridor_center_error_mm": corridor_center_error_mm,
         "corridor_center_error_px": corridor_center_error_px,
         "visual_steering_correction": steering if valid else 0.0,
@@ -1175,6 +1228,11 @@ def estimate_safe_corridor(
         "right_lane_segment_width_px": float(right_lane_rows[0][1] - right_lane_rows[0][0]) if right_lane_rows else None,
         "right_lane_lock_active": bool(right_lane_lock_active),
         "right_lane_lock_reason": right_lane_lock_reason if use_right_lane_lock else "disabled",
+        "ego_reference_x": ego_reference_x,
+        "camera_center_offset_px": camera_center_offset_px,
+        "lane_center_x": lane_center_x,
+        "unphysical_corridor_geometry": bool(unphysical_corridor_geometry),
+        "steering_saturation_count": 0,
     }
 
 
@@ -1196,6 +1254,8 @@ def make_safe_corridor_result(
         "lane_width_valid": False,
         "left_clearance_mm": None,
         "right_clearance_mm": None,
+        "left_space_mm": None,
+        "right_space_mm": None,
         "corridor_center_error_mm": None,
         "corridor_center_error_px": None,
         "visual_steering_correction": 0.0,
@@ -1210,7 +1270,34 @@ def make_safe_corridor_result(
         "right_lane_segment_width_px": None,
         "right_lane_lock_active": right_lane_lock_active,
         "right_lane_lock_reason": right_lane_lock_reason,
+        "ego_reference_x": 0.0,
+        "camera_center_offset_px": cfg_float(detector_config, "CAMERA_CENTER_OFFSET_PX", CAMERA_CENTER_OFFSET_PX),
+        "lane_center_x": None,
+        "unphysical_corridor_geometry": False,
+        "steering_saturation_count": 0,
     }
+
+
+def apply_steering_saturation_gate(safe_corridor, safe_corridor_state, detector_config=None):
+    # A helper that sits at the steering clamp for many frames is not giving
+    # useful local guidance. Turn it off until geometry becomes believable.
+    max_correction = cfg_float(detector_config, "SAFE_MAX_STEERING_CORRECTION", SAFE_MAX_STEERING_CORRECTION)
+    max_frames = cfg_int(detector_config, "MAX_STEERING_SATURATION_FRAMES", MAX_STEERING_SATURATION_FRAMES)
+    saturated = (
+        safe_corridor["safe_corridor_valid"]
+        and abs(safe_corridor["visual_steering_correction"]) >= max_correction - 1e-9
+    )
+    if safe_corridor_state is None:
+        count = 1 if saturated else 0
+    else:
+        count = safe_corridor_state.get("steering_saturation_count", 0) + 1 if saturated else 0
+        safe_corridor_state["steering_saturation_count"] = count
+    safe_corridor["steering_saturation_count"] = count
+    if count > max_frames:
+        safe_corridor["safe_corridor_valid"] = False
+        safe_corridor["visual_helper_active"] = False
+        safe_corridor["visual_steering_correction"] = 0.0
+        safe_corridor["safe_corridor_reason"] = "steering_saturated_too_long"
 
 
 def count_safe_corridor_yellow_crossing(safe_rows, yellow_boundary_mask, height, width):
@@ -1536,6 +1623,9 @@ def draw_debug_text(output, result, confidences, selected_path, smoothed_curve_e
         f"ego_fallback: {result.ego_component_fallback_used}",
         f"safe_corridor_valid: {result.safe_corridor_valid}",
         f"helper_active: {result.visual_helper_active}",
+        f"ego_ref_x: {result.ego_reference_x:.1f}",
+        f"cam_offset_px: {result.camera_center_offset_px:.1f}",
+        f"lane_center_x: {safe_fmt(result.lane_center_x)}",
         f"lane_width_mm: {safe_fmt(result.measured_lane_width_mm)}",
         f"L/R clear_mm: {safe_fmt(result.left_clearance_mm)}/{safe_fmt(result.right_clearance_mm)}",
         f"corridor_err_mm: {safe_fmt(result.corridor_center_error_mm)}",
@@ -1852,6 +1942,13 @@ def get_config_used(settings, config_source=None):
         "NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO": NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO,
         "NO_YELLOW_MAX_MEASURED_WIDTH_MM": NO_YELLOW_MAX_MEASURED_WIDTH_MM,
         "ALLOW_NO_YELLOW_BLOB_SPLIT": ALLOW_NO_YELLOW_BLOB_SPLIT,
+        "CAMERA_CENTER_X_RATIO": CAMERA_CENTER_X_RATIO,
+        "CAMERA_CENTER_OFFSET_PX": CAMERA_CENTER_OFFSET_PX,
+        "CAMERA_CENTER_OFFSET_MM": CAMERA_CENTER_OFFSET_MM,
+        "MIN_CLEARANCE_MM": MIN_CLEARANCE_MM,
+        "MAX_REASONABLE_CORRIDOR_ERROR_MM": MAX_REASONABLE_CORRIDOR_ERROR_MM,
+        "MAX_REASONABLE_CLEARANCE_MM": MAX_REASONABLE_CLEARANCE_MM,
+        "MAX_STEERING_SATURATION_FRAMES": MAX_STEERING_SATURATION_FRAMES,
         "CENTERLINE_SMOOTHING_ALPHA": CENTERLINE_SMOOTHING_ALPHA,
         "CURVE_DEADBAND_PX": CURVE_DEADBAND_PX,
         "CURVE_STRONG_PX": CURVE_STRONG_PX,
@@ -1955,6 +2052,13 @@ def build_telemetry_row(frame_index, time_sec, result, confidences, selected_pat
         "right_lane_segment_width_px": safe_number(result.right_lane_segment_width_px),
         "right_lane_lock_active": result.right_lane_lock_active,
         "right_lane_lock_reason": result.right_lane_lock_reason,
+        "ego_reference_x": f"{result.ego_reference_x:.2f}",
+        "camera_center_offset_px": f"{result.camera_center_offset_px:.2f}",
+        "lane_center_x": safe_number(result.lane_center_x),
+        "left_space_mm": safe_number(result.left_space_mm),
+        "right_space_mm": safe_number(result.right_space_mm),
+        "unphysical_corridor_geometry": result.unphysical_corridor_geometry,
+        "steering_saturation_count": result.steering_saturation_count,
         "selected_path": selected_path,
         "straight_confidence": f"{confidences['straight']:.4f}",
         "left_confidence": f"{confidences['left']:.4f}",
@@ -2194,6 +2298,9 @@ def write_human_summary(path, args, processed_frames, duration_sec, stats, recom
         f"Visual helper active percent: {stats['visual_helper_active_percent']:.1f}%",
         f"Average measured lane width: {stats['average_measured_lane_width_mm']:.2f} mm",
         f"Average absolute corridor center error: {stats['average_abs_corridor_center_error_mm']:.2f} mm",
+        f"Average valid left clearance: {stats['average_valid_left_clearance_mm']:.2f} mm",
+        f"Average valid right clearance: {stats['average_valid_right_clearance_mm']:.2f} mm",
+        f"Average valid absolute corridor error: {stats['average_valid_abs_corridor_center_error_mm']:.2f} mm",
         f"Right-lane lock active percent: {stats['right_lane_lock_active_percent']:.1f}%",
         f"Right-lane segment found percent: {stats['right_lane_segment_found_percent']:.1f}%",
         "",
@@ -2248,6 +2355,12 @@ def write_ai_summary_json(path, args, processed_frames, total_frames, duration_s
         "average_abs_corridor_center_error_mm": stats["average_abs_corridor_center_error_mm"],
         "max_abs_corridor_center_error_mm": stats["max_abs_corridor_center_error_mm"],
         "inactive_reason_counts": stats["inactive_reason_counts"],
+        "unphysical_corridor_geometry_count": stats["unphysical_corridor_geometry_count"],
+        "steering_saturated_too_long_count": stats["steering_saturated_too_long_count"],
+        "average_valid_left_clearance_mm": stats["average_valid_left_clearance_mm"],
+        "average_valid_right_clearance_mm": stats["average_valid_right_clearance_mm"],
+        "average_valid_abs_corridor_center_error_mm": stats["average_valid_abs_corridor_center_error_mm"],
+        "visual_steering_saturation_percent": stats["visual_steering_saturation_percent"],
         "right_lane_lock_active_percent": stats["right_lane_lock_active_percent"],
         "right_lane_segment_found_percent": stats["right_lane_segment_found_percent"],
         "wide_blob_no_yellow_count": stats["wide_blob_no_yellow_count"],
@@ -2318,6 +2431,10 @@ def collect_stats(rows, event_counts, processed_frames):
     right_clearances_mm = numeric_values(rows, "right_clearance_mm")
     corridor_errors_mm = numeric_values(rows, "corridor_center_error_mm")
     steering_corrections = numeric_values(rows, "visual_steering_correction")
+    valid_safe_rows = [row for row in rows if row["safe_corridor_valid"] is True]
+    valid_left_clearances = numeric_values(valid_safe_rows, "left_clearance_mm")
+    valid_right_clearances = numeric_values(valid_safe_rows, "right_clearance_mm")
+    valid_corridor_errors = numeric_values(valid_safe_rows, "corridor_center_error_mm")
     inactive_reason_counts = Counter(
         row["safe_corridor_reason"] for row in rows if row["safe_corridor_reason"] != "valid"
     )
@@ -2369,6 +2486,20 @@ def collect_stats(rows, event_counts, processed_frames):
         "average_abs_corridor_center_error_mm": average([abs(value) for value in corridor_errors_mm]),
         "max_abs_corridor_center_error_mm": max([abs(value) for value in corridor_errors_mm]) if corridor_errors_mm else 0.0,
         "average_abs_visual_steering_correction": average([abs(value) for value in steering_corrections]),
+        "average_valid_left_clearance_mm": average(valid_left_clearances),
+        "average_valid_right_clearance_mm": average(valid_right_clearances),
+        "average_valid_abs_corridor_center_error_mm": average([abs(value) for value in valid_corridor_errors]),
+        "unphysical_corridor_geometry_count": inactive_reason_counts["unphysical_corridor_geometry"],
+        "steering_saturated_too_long_count": inactive_reason_counts["steering_saturated_too_long"],
+        "visual_steering_saturation_percent": (
+            sum(
+                1
+                for row in rows
+                if abs(float(row["visual_steering_correction"])) >= SAFE_MAX_STEERING_CORRECTION - 1e-9
+            )
+            / max(1, processed_frames)
+            * 100.0
+        ),
         "inactive_reason_counts": dict(inactive_reason_counts),
         "right_lane_lock_active_percent": right_lane_lock_active_count / max(1, processed_frames) * 100.0,
         "right_lane_segment_found_percent": right_lane_segment_found_count / max(1, processed_frames) * 100.0,
@@ -2429,6 +2560,7 @@ def process_video_tuning_mode(args):
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
     lane_side_memory = {}
+    safe_corridor_state = {}
     tracker = PathConfidenceTracker()
 
     print("Manual video tuning controls:")
@@ -2460,6 +2592,7 @@ def process_video_tuning_mode(args):
                 settings,
                 use_yellow_boundary_lock,
                 lane_side_memory,
+                safe_corridor_state,
             )
             if result.road_detected and result.road_center_x is not None:
                 last_center_x = result.road_center_x
@@ -2688,6 +2821,13 @@ def process_video_source(args):
         "right_lane_segment_width_px",
         "right_lane_lock_active",
         "right_lane_lock_reason",
+        "ego_reference_x",
+        "camera_center_offset_px",
+        "lane_center_x",
+        "left_space_mm",
+        "right_space_mm",
+        "unphysical_corridor_geometry",
+        "steering_saturation_count",
         "selected_path",
         "straight_confidence",
         "left_confidence",
@@ -2711,6 +2851,7 @@ def process_video_source(args):
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
     lane_side_memory = {}
+    safe_corridor_state = {}
     frame_index = 0
     processed_frames = 0
     failure_saved_count = 0
@@ -2768,6 +2909,7 @@ def process_video_source(args):
                     frames_since_valid,
                     detector_config=settings,
                     lane_side_memory=lane_side_memory,
+                    safe_corridor_state=safe_corridor_state,
                 )
 
                 if result.road_detected and result.road_center_x is not None:
@@ -2966,6 +3108,7 @@ def main():
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
     lane_side_memory = {}
+    safe_corridor_state = {}
 
     try:
         while True:
@@ -2978,7 +3121,14 @@ def main():
 
             frame = last_frame.copy()
             settings = get_trackbar_settings()
-            result = detect_road(frame, settings, last_center_x, frames_since_valid, lane_side_memory=lane_side_memory)
+            result = detect_road(
+                frame,
+                settings,
+                last_center_x,
+                frames_since_valid,
+                lane_side_memory=lane_side_memory,
+                safe_corridor_state=safe_corridor_state,
+            )
 
             if result.road_detected and result.road_center_x is not None:
                 last_center_x = result.road_center_x
