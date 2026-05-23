@@ -1,6 +1,6 @@
 {
   "source_video": "assets\\test_video_2.mp4",
-  "last_saved_frame_index": null,
+  "last_saved_frame_index": 8435,
   "config_output_path": "configs\\csi_front_tuned_config.json",
   "good_sample_frames": [],
   "difficult_sample_frames": [],
@@ -9,7 +9,7 @@
     "H_min": 0,
     "H_max": 174,
     "S_min": 0,
-    "S_max": 176,
+    "S_max": 202,
     "V_min": 0,
     "V_max": 101,
     "ROI_top_percent": 67,

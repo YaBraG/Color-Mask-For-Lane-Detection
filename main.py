@@ -58,6 +58,16 @@ from config import (
     YELLOW_BOUNDARY_DILATE_PX,
     YELLOW_MAX_CROSSING_PIXELS,
     LANE_SIDE_HOLD_FRAMES,
+    USE_RIGHT_LANE_YELLOW_LOCK,
+    RIGHT_LANE_FROM_YELLOW,
+    YELLOW_LANE_SIDE,
+    YELLOW_LANE_SEARCH_MARGIN_PX,
+    YELLOW_MIN_PIXELS_PER_SCANLINE,
+    YELLOW_RIGHT_LANE_HOLD_FRAMES,
+    USE_NO_YELLOW_WIDE_BLOB_GATE,
+    NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO,
+    NO_YELLOW_MAX_MEASURED_WIDTH_MM,
+    ALLOW_NO_YELLOW_BLOB_SPLIT,
     MAX_CENTER_JUMP_PX,
     MIN_SEGMENT_WIDTH_PX,
     REALSENSE_FPS,
@@ -136,6 +146,13 @@ class RoadResult:
     yellow_boundary_enforced: bool
     selected_lane_side: str
     yellow_crossing_pixels: int
+    yellow_right_edge_x: int | None
+    right_lane_segment_found: bool
+    right_lane_segment_left_x: int | None
+    right_lane_segment_right_x: int | None
+    right_lane_segment_width_px: float | None
+    right_lane_lock_active: bool
+    right_lane_lock_reason: str
     scan_points: list[tuple[int, int, int, int]]
     boundary_points: list[tuple[int, int]]
 
@@ -565,6 +582,51 @@ def update_lane_side_memory(candidate_side, lane_side_memory, detector_config=No
     return current_side
 
 
+def update_right_lane_memory(yellow_visible, right_segment_found, lane_side_memory, detector_config=None):
+    # For the CSI front view, the desired lane is the right side of the yellow
+    # divider. Hold that side briefly if the yellow line disappears so the
+    # helper does not flicker between lanes frame-to-frame.
+    if lane_side_memory is None:
+        return "right" if yellow_visible and right_segment_found else "unknown"
+    hold_frames = cfg_int(detector_config, "YELLOW_RIGHT_LANE_HOLD_FRAMES", YELLOW_RIGHT_LANE_HOLD_FRAMES)
+    if yellow_visible and right_segment_found:
+        lane_side_memory["right_lane_hold"] = hold_frames
+        lane_side_memory["side"] = "right"
+        return "right"
+    remaining = max(0, lane_side_memory.get("right_lane_hold", 0) - 1)
+    lane_side_memory["right_lane_hold"] = remaining
+    if remaining > 0:
+        lane_side_memory["side"] = "right"
+        return "right"
+    return "unknown"
+
+
+def find_yellow_right_edge_near_row(yellow_boundary_mask, y, detector_config=None):
+    if yellow_boundary_mask is None:
+        return None
+    height = yellow_boundary_mask.shape[0]
+    y1 = max(0, int(y) - 3)
+    y2 = min(height - 1, int(y) + 3)
+    points = cv2.findNonZero(yellow_boundary_mask[y1 : y2 + 1, :])
+    min_pixels = cfg_int(detector_config, "YELLOW_MIN_PIXELS_PER_SCANLINE", YELLOW_MIN_PIXELS_PER_SCANLINE)
+    if points is None or len(points) < min_pixels:
+        return None
+    xs = points.reshape(-1, 2)[:, 0]
+    return int(np.max(xs))
+
+
+def select_right_lane_segment_from_yellow(segments, yellow_right_edge_x, detector_config=None):
+    if yellow_right_edge_x is None:
+        return None
+    allowed_start_x = yellow_right_edge_x + cfg_int(detector_config, "YELLOW_LANE_SEARCH_MARGIN_PX", YELLOW_LANE_SEARCH_MARGIN_PX)
+    candidates = [segment for segment in segments if segment[1] >= allowed_start_x]
+    if not candidates:
+        return None
+    # Choose the road segment immediately to the right of the yellow boundary,
+    # not the biggest segment or the one nearest image center.
+    return min(candidates, key=lambda segment: max(0, segment[0] - allowed_start_x))
+
+
 def apply_yellow_lane_side_clip(mask, yellow_boundary_mask, selected_lane_side):
     # If the yellow line is visible, remove road pixels on the opposite side
     # row-by-row. This keeps the safe hallway on the ego lane side even when
@@ -627,11 +689,16 @@ def detect_road(
 
     raw_mask = full_mask.copy()
     mask, ego_debug = keep_relevant_component(full_mask, settings, use_ego_connected_mask, detector_config)
-    selected_lane_side = update_lane_side_memory(
-        estimate_lane_side(ego_debug, yellow_boundary_mask),
-        lane_side_memory,
-        detector_config,
-    )
+    yellow_visible = cv2.countNonZero(yellow_boundary_mask) > 0
+    right_lane_lock_enabled = bool(cfg_value(detector_config, "USE_RIGHT_LANE_YELLOW_LOCK", USE_RIGHT_LANE_YELLOW_LOCK))
+    if right_lane_lock_enabled and yellow_visible:
+        selected_lane_side = update_right_lane_memory(True, True, lane_side_memory, detector_config)
+    else:
+        selected_lane_side = update_lane_side_memory(
+            estimate_lane_side(ego_debug, yellow_boundary_mask),
+            lane_side_memory,
+            detector_config,
+        )
     if use_yellow_boundary_lock and selected_lane_side in ("left", "right"):
         mask = apply_yellow_lane_side_clip(mask, yellow_boundary_mask, selected_lane_side)
     area = int(cv2.countNonZero(mask))
@@ -670,6 +737,13 @@ def detect_road(
         use_yellow_boundary_lock,
         selected_lane_side,
     )
+    if right_lane_lock_enabled:
+        selected_lane_side = update_right_lane_memory(
+            yellow_visible,
+            safe_corridor["right_lane_segment_found"],
+            lane_side_memory,
+            detector_config,
+        )
 
     road_center_x = None
     road_center_error_px = None
@@ -743,6 +817,13 @@ def detect_road(
         yellow_boundary_enforced=bool(use_yellow_boundary_lock),
         selected_lane_side=selected_lane_side,
         yellow_crossing_pixels=safe_corridor["yellow_crossing_pixels"],
+        yellow_right_edge_x=safe_corridor["yellow_right_edge_x"],
+        right_lane_segment_found=safe_corridor["right_lane_segment_found"],
+        right_lane_segment_left_x=safe_corridor["right_lane_segment_left_x"],
+        right_lane_segment_right_x=safe_corridor["right_lane_segment_right_x"],
+        right_lane_segment_width_px=safe_corridor["right_lane_segment_width_px"],
+        right_lane_lock_active=safe_corridor["right_lane_lock_active"],
+        right_lane_lock_reason=safe_corridor["right_lane_lock_reason"],
         scan_points=scan_points,
         boundary_points=boundary_points,
     )
@@ -915,12 +996,40 @@ def estimate_safe_corridor(
     ).astype(int)
 
     safe_rows = []
+    right_lane_rows = []
+    yellow_right_edges = []
+    yellow_visible_on_rows = False
+    right_lane_lock_active = False
+    right_lane_lock_reason = "disabled"
+    use_right_lane_lock = (
+        yellow_boundary_enforced
+        and bool(cfg_value(detector_config, "USE_RIGHT_LANE_YELLOW_LOCK", USE_RIGHT_LANE_YELLOW_LOCK))
+        and bool(cfg_value(detector_config, "RIGHT_LANE_FROM_YELLOW", RIGHT_LANE_FROM_YELLOW))
+        and str(cfg_value(detector_config, "YELLOW_LANE_SIDE", YELLOW_LANE_SIDE)).lower() == "right"
+    )
+    if use_right_lane_lock:
+        right_lane_lock_reason = "yellow_not_visible"
     for index, y in enumerate(rows):
         y = min(max(0, int(y)), height - 1)
         segments = find_road_segments(mask[y, :], cfg_int(detector_config, "MIN_SEGMENT_WIDTH_PX", MIN_SEGMENT_WIDTH_PX))
         if not segments:
             continue
-        left_x, right_x, segment_center_x = min(segments, key=lambda segment: abs(segment[2] - image_center_x))
+        yellow_right_edge_x = find_yellow_right_edge_near_row(yellow_boundary_mask, y, detector_config)
+        selected_segment = None
+        if use_right_lane_lock and yellow_right_edge_x is not None:
+            yellow_visible_on_rows = True
+            yellow_right_edges.append(yellow_right_edge_x)
+            selected_segment = select_right_lane_segment_from_yellow(segments, yellow_right_edge_x, detector_config)
+            if selected_segment is not None:
+                right_lane_rows.append(selected_segment)
+                right_lane_lock_active = True
+                right_lane_lock_reason = "yellow_right_lane_selected"
+        if selected_segment is None:
+            if use_right_lane_lock and yellow_right_edge_x is not None:
+                right_lane_lock_reason = "yellow_visible_no_right_segment"
+                continue
+            selected_segment = min(segments, key=lambda segment: abs(segment[2] - image_center_x))
+        left_x, right_x, segment_center_x = selected_segment
         lane_width_px = max(1.0, float(right_x - left_x))
         safe_rows.append(
             {
@@ -929,6 +1038,7 @@ def estimate_safe_corridor(
                 "right_x": int(right_x),
                 "center_x": float(segment_center_x),
                 "lane_width_px": lane_width_px,
+                "yellow_right_edge_x": yellow_right_edge_x,
                 # Lower rows are closer to the car, so they should dominate
                 # the helper correction more than farther scanlines.
                 "weight": cfg_float(detector_config, "SAFE_SCANLINE_NEAR_WEIGHT_BIAS", SAFE_SCANLINE_NEAR_WEIGHT_BIAS) - (index / max(1, len(rows) - 1)),
@@ -936,7 +1046,15 @@ def estimate_safe_corridor(
         )
 
     if not safe_rows:
-        return make_safe_corridor_result("edge_detection_failed", [], detector_config)
+        reason = "yellow_visible_no_right_segment" if yellow_visible_on_rows else "edge_detection_failed"
+        return make_safe_corridor_result(
+            reason,
+            [],
+            detector_config,
+            yellow_right_edge_x=max(yellow_right_edges) if yellow_right_edges else None,
+            right_lane_lock_active=False,
+            right_lane_lock_reason=right_lane_lock_reason if yellow_visible_on_rows else "yellow_not_visible",
+        )
 
     weights = np.array([row["weight"] for row in safe_rows], dtype=np.float32)
     widths_px = np.array([row["lane_width_px"] for row in safe_rows], dtype=np.float32)
@@ -995,11 +1113,22 @@ def estimate_safe_corridor(
         height,
         width,
     )
+    yellow_visible = yellow_boundary_mask is not None and cv2.countNonZero(yellow_boundary_mask) > 0
+    wide_blob_no_yellow = (
+        bool(cfg_value(detector_config, "USE_NO_YELLOW_WIDE_BLOB_GATE", USE_NO_YELLOW_WIDE_BLOB_GATE))
+        and not yellow_visible
+        and (
+            measured_lane_width_px > width * cfg_float(detector_config, "NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO", NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO)
+            or measured_lane_width_mm > cfg_float(detector_config, "NO_YELLOW_MAX_MEASURED_WIDTH_MM", NO_YELLOW_MAX_MEASURED_WIDTH_MM)
+        )
+    )
     reason = "valid"
     if not ego_debug["ego_component_found"]:
         reason = "ego_component_missing"
     elif road_confidence < cfg_float(detector_config, "SAFE_MIN_ROAD_CONFIDENCE", SAFE_MIN_ROAD_CONFIDENCE):
         reason = "low_confidence"
+    elif use_right_lane_lock and yellow_visible_on_rows and not right_lane_rows:
+        reason = "yellow_visible_no_right_segment"
     elif len(safe_rows) < cfg_int(detector_config, "SAFE_MIN_VALID_SCANLINES", SAFE_MIN_VALID_SCANLINES):
         reason = "insufficient_scanlines"
     elif (
@@ -1007,6 +1136,8 @@ def estimate_safe_corridor(
         and yellow_crossing_pixels > cfg_int(detector_config, "YELLOW_MAX_CROSSING_PIXELS", YELLOW_MAX_CROSSING_PIXELS)
     ):
         reason = "crosses_yellow_boundary"
+    elif wide_blob_no_yellow:
+        reason = "wide_blob_no_yellow"
     elif measured_lane_width_mm < min_width:
         reason = "too_narrow"
     elif measured_lane_width_mm > max_width:
@@ -1037,10 +1168,24 @@ def estimate_safe_corridor(
         "safe_scanline_rows": safe_rows,
         "safe_corridor_reason": reason,
         "yellow_crossing_pixels": yellow_crossing_pixels,
+        "yellow_right_edge_x": max(yellow_right_edges) if yellow_right_edges else None,
+        "right_lane_segment_found": bool(right_lane_rows),
+        "right_lane_segment_left_x": int(right_lane_rows[0][0]) if right_lane_rows else None,
+        "right_lane_segment_right_x": int(right_lane_rows[0][1]) if right_lane_rows else None,
+        "right_lane_segment_width_px": float(right_lane_rows[0][1] - right_lane_rows[0][0]) if right_lane_rows else None,
+        "right_lane_lock_active": bool(right_lane_lock_active),
+        "right_lane_lock_reason": right_lane_lock_reason if use_right_lane_lock else "disabled",
     }
 
 
-def make_safe_corridor_result(reason, rows, detector_config=None):
+def make_safe_corridor_result(
+    reason,
+    rows,
+    detector_config=None,
+    yellow_right_edge_x=None,
+    right_lane_lock_active=False,
+    right_lane_lock_reason="disabled",
+):
     return {
         "safe_corridor_valid": False,
         "visual_helper_active": False,
@@ -1058,6 +1203,13 @@ def make_safe_corridor_result(reason, rows, detector_config=None):
         "safe_scanline_rows": rows,
         "safe_corridor_reason": reason,
         "yellow_crossing_pixels": 0,
+        "yellow_right_edge_x": yellow_right_edge_x,
+        "right_lane_segment_found": False,
+        "right_lane_segment_left_x": None,
+        "right_lane_segment_right_x": None,
+        "right_lane_segment_width_px": None,
+        "right_lane_lock_active": right_lane_lock_active,
+        "right_lane_lock_reason": right_lane_lock_reason,
     }
 
 
@@ -1305,6 +1457,15 @@ def draw_yellow_boundary(output, result):
         0.65,
         0,
     )
+    if result.yellow_right_edge_x is not None:
+        x = int(result.yellow_right_edge_x)
+        cv2.line(output, (x, 0), (x, output.shape[0] - 1), (0, 255, 255), 2, cv2.LINE_AA)
+        start_x = x + YELLOW_LANE_SEARCH_MARGIN_PX
+        cv2.line(output, (start_x, 0), (start_x, output.shape[0] - 1), (255, 255, 0), 1, cv2.LINE_AA)
+    if result.right_lane_lock_active:
+        cv2.putText(output, "RIGHT LANE LOCK", (output.shape[1] - 280, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
+    elif result.safe_corridor_reason == "wide_blob_no_yellow":
+        cv2.putText(output, "WIDE BLOB NO YELLOW - HELPER OFF", (output.shape[1] - 520, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 255), 2, cv2.LINE_AA)
 
 
 def draw_candidate_paths(output, confidences, selected_path):
@@ -1383,6 +1544,8 @@ def draw_debug_text(output, result, confidences, selected_path, smoothed_curve_e
         f"yellow_lock: {result.yellow_boundary_enforced}",
         f"lane_side: {result.selected_lane_side}",
         f"yellow_cross_px: {result.yellow_crossing_pixels}",
+        f"right_lane_lock: {result.right_lane_lock_active}",
+        f"right_lane_reason: {result.right_lane_lock_reason}",
         f"selected_path(debug): {selected_path}",
         f"straight_confidence: {confidences['straight']:.2f}",
         f"left_confidence: {confidences['left']:.2f}",
@@ -1679,6 +1842,16 @@ def get_config_used(settings, config_source=None):
         "YELLOW_BOUNDARY_DILATE_PX": YELLOW_BOUNDARY_DILATE_PX,
         "YELLOW_MAX_CROSSING_PIXELS": YELLOW_MAX_CROSSING_PIXELS,
         "LANE_SIDE_HOLD_FRAMES": LANE_SIDE_HOLD_FRAMES,
+        "USE_RIGHT_LANE_YELLOW_LOCK": USE_RIGHT_LANE_YELLOW_LOCK,
+        "RIGHT_LANE_FROM_YELLOW": RIGHT_LANE_FROM_YELLOW,
+        "YELLOW_LANE_SIDE": YELLOW_LANE_SIDE,
+        "YELLOW_LANE_SEARCH_MARGIN_PX": YELLOW_LANE_SEARCH_MARGIN_PX,
+        "YELLOW_MIN_PIXELS_PER_SCANLINE": YELLOW_MIN_PIXELS_PER_SCANLINE,
+        "YELLOW_RIGHT_LANE_HOLD_FRAMES": YELLOW_RIGHT_LANE_HOLD_FRAMES,
+        "USE_NO_YELLOW_WIDE_BLOB_GATE": USE_NO_YELLOW_WIDE_BLOB_GATE,
+        "NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO": NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO,
+        "NO_YELLOW_MAX_MEASURED_WIDTH_MM": NO_YELLOW_MAX_MEASURED_WIDTH_MM,
+        "ALLOW_NO_YELLOW_BLOB_SPLIT": ALLOW_NO_YELLOW_BLOB_SPLIT,
         "CENTERLINE_SMOOTHING_ALPHA": CENTERLINE_SMOOTHING_ALPHA,
         "CURVE_DEADBAND_PX": CURVE_DEADBAND_PX,
         "CURVE_STRONG_PX": CURVE_STRONG_PX,
@@ -1775,6 +1948,13 @@ def build_telemetry_row(frame_index, time_sec, result, confidences, selected_pat
         "yellow_boundary_enforced": result.yellow_boundary_enforced,
         "selected_lane_side": result.selected_lane_side,
         "yellow_crossing_pixels": result.yellow_crossing_pixels,
+        "yellow_right_edge_x": safe_number(result.yellow_right_edge_x),
+        "right_lane_segment_found": result.right_lane_segment_found,
+        "right_lane_segment_left_x": safe_number(result.right_lane_segment_left_x),
+        "right_lane_segment_right_x": safe_number(result.right_lane_segment_right_x),
+        "right_lane_segment_width_px": safe_number(result.right_lane_segment_width_px),
+        "right_lane_lock_active": result.right_lane_lock_active,
+        "right_lane_lock_reason": result.right_lane_lock_reason,
         "selected_path": selected_path,
         "straight_confidence": f"{confidences['straight']:.4f}",
         "left_confidence": f"{confidences['left']:.4f}",
@@ -2014,6 +2194,8 @@ def write_human_summary(path, args, processed_frames, duration_sec, stats, recom
         f"Visual helper active percent: {stats['visual_helper_active_percent']:.1f}%",
         f"Average measured lane width: {stats['average_measured_lane_width_mm']:.2f} mm",
         f"Average absolute corridor center error: {stats['average_abs_corridor_center_error_mm']:.2f} mm",
+        f"Right-lane lock active percent: {stats['right_lane_lock_active_percent']:.1f}%",
+        f"Right-lane segment found percent: {stats['right_lane_segment_found_percent']:.1f}%",
         "",
         "Major problems found:",
     ]
@@ -2066,6 +2248,10 @@ def write_ai_summary_json(path, args, processed_frames, total_frames, duration_s
         "average_abs_corridor_center_error_mm": stats["average_abs_corridor_center_error_mm"],
         "max_abs_corridor_center_error_mm": stats["max_abs_corridor_center_error_mm"],
         "inactive_reason_counts": stats["inactive_reason_counts"],
+        "right_lane_lock_active_percent": stats["right_lane_lock_active_percent"],
+        "right_lane_segment_found_percent": stats["right_lane_segment_found_percent"],
+        "wide_blob_no_yellow_count": stats["wide_blob_no_yellow_count"],
+        "yellow_visible_no_right_segment_count": stats["yellow_visible_no_right_segment_count"],
         "config_used": get_config_used(settings, config_source),
         "known_problem_intervals": problem_intervals,
     }
@@ -2135,6 +2321,8 @@ def collect_stats(rows, event_counts, processed_frames):
     inactive_reason_counts = Counter(
         row["safe_corridor_reason"] for row in rows if row["safe_corridor_reason"] != "valid"
     )
+    right_lane_lock_active_count = sum(1 for row in rows if row.get("right_lane_lock_active") is True)
+    right_lane_segment_found_count = sum(1 for row in rows if row.get("right_lane_segment_found") is True)
 
     abs_center_errors = [abs(float(value)) for value in center_errors]
     abs_curve_errors = [abs(float(value)) for value in curve_errors]
@@ -2182,6 +2370,10 @@ def collect_stats(rows, event_counts, processed_frames):
         "max_abs_corridor_center_error_mm": max([abs(value) for value in corridor_errors_mm]) if corridor_errors_mm else 0.0,
         "average_abs_visual_steering_correction": average([abs(value) for value in steering_corrections]),
         "inactive_reason_counts": dict(inactive_reason_counts),
+        "right_lane_lock_active_percent": right_lane_lock_active_count / max(1, processed_frames) * 100.0,
+        "right_lane_segment_found_percent": right_lane_segment_found_count / max(1, processed_frames) * 100.0,
+        "wide_blob_no_yellow_count": inactive_reason_counts["wide_blob_no_yellow"],
+        "yellow_visible_no_right_segment_count": inactive_reason_counts["yellow_visible_no_right_segment"],
         "major_problems": major_problems,
     }
 
@@ -2489,6 +2681,13 @@ def process_video_source(args):
         "yellow_boundary_enforced",
         "selected_lane_side",
         "yellow_crossing_pixels",
+        "yellow_right_edge_x",
+        "right_lane_segment_found",
+        "right_lane_segment_left_x",
+        "right_lane_segment_right_x",
+        "right_lane_segment_width_px",
+        "right_lane_lock_active",
+        "right_lane_lock_reason",
         "selected_path",
         "straight_confidence",
         "left_confidence",

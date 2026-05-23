@@ -149,6 +149,18 @@ When `USE_YELLOW_BOUNDARY_LOCK = True`, the yellow line acts as a no-cross divid
 
 Manual video tuning has a debug toggle: press `y` to turn yellow-boundary enforcement on or off for comparison. Frame samples include `yellow_boundary_mask` so the road mask, ego mask, and yellow divider can be inspected separately.
 
+## Right-Lane Yellow Lock
+
+For the current front CSI camera workflow, the desired lane is the right side of the yellow divider. When yellow is visible, the safe corridor does not pick the largest black blob or the blob nearest image center. Instead, each lower safe-corridor scanline finds the right edge of the yellow mask, adds a small search margin, and uses the road segment immediately to the right of that boundary.
+
+This keeps the blue hallway on the car's current right-lane side:
+
+- yellow line = lane divider
+- right side of yellow = allowed lane
+- left side of yellow = ignored for the safe corridor
+
+If no right-lane segment is found while yellow is visible, the helper disables itself instead of guessing. If yellow is not visible and the ego road blob is too wide, the helper also disables itself with `safe_corridor_reason = "wide_blob_no_yellow"`. This prevents open black road areas, intersections, or parking-lot-like blobs from pulling the blue hallway into an ambiguous path.
+
 ## Manual Video Tuning Mode
 
 Manual video tuning plays a recorded QCar2 ride with the same 2x2 display used by the detector: original RGB, road mask, road overlay, and detected center path/debug view. It is for finding a good RGB/OpenCV/NumPy baseline config before building the future auto-tuning optimizer.

@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-05-23
+
+Files changed:
+
+- `config.py`
+- `main.py`
+- `auto_tuner.py`
+- `README.md`
+- `CHANGELOG.md`
+
+Summary:
+
+- Added forced right-lane yellow lock for safe-corridor scanlines.
+- When yellow is visible, the safe corridor now uses the road segment immediately to the right of the yellow boundary and ignores left-lane road segments.
+- Added lane-side hold behavior for the right-lane lock so selected side does not flicker when yellow briefly disappears.
+- Added a no-yellow wide-blob gate that disables the helper with `safe_corridor_reason = "wide_blob_no_yellow"` instead of guessing in open/ambiguous black road areas.
+- Added telemetry/debug fields for yellow right edge, right-lane segment geometry, right-lane lock state, and right-lane lock reason.
+
+Why:
+
+- The blue safe corridor could still focus on the wrong lane when yellow was visible or become confused by very wide road blobs with no visible divider.
+
+Known limitation:
+
+- If the yellow line is not detected correctly, the helper may disable itself instead of guessing.
+
+Follow-up work:
+
+- Add route-level logic that can intentionally allow crossing the yellow boundary when the planned path requires it.
+
 ## 2026-05-22
 
 Files changed:
