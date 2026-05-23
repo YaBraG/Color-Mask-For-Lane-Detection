@@ -13,89 +13,179 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from config import (
-    ALLOW_FIRST_ANCHOR_JUMP,
-    CENTERLINE_ALPHA,
-    CENTERLINE_SMOOTHING_ALPHA,
-    CENTER_DEADBAND_PX,
-    CENTER_STRONG_PX,
-    CONFIDENCE_ALPHA,
-    CONFIG_FILE,
-    CURVE_DEADBAND_PX,
-    CURVE_STRONG_PX,
-    DEFAULT_SETTINGS,
-    EGO_BOTTOM_BAND_PERCENT,
-    EGO_MIN_COMPONENT_AREA_PERCENT,
-    EGO_SEED_SEARCH_RADIUS_PX,
-    EGO_SEED_X_RATIO,
-    EGO_SEED_Y_RATIO,
-    FRAME_HEIGHT,
-    FRAME_WIDTH,
-    LAST_CENTER_HOLD_FRAMES,
-    LANE_WIDTH_MM,
-    CAR_WIDTH_MM,
-    SIDEWALK_MARGIN_MM,
-    LINE_MARGIN_MM,
-    SAFE_HALLWAY_WIDTH_MM,
-    MIN_VALID_LANE_WIDTH_MM,
-    MAX_VALID_LANE_WIDTH_MM,
-    SAFE_SCANLINE_COUNT,
-    SAFE_SCANLINE_START_RATIO,
-    SAFE_SCANLINE_END_RATIO,
-    SAFE_SCANLINE_NEAR_WEIGHT_BIAS,
-    SAFE_MIN_VALID_SCANLINES,
-    SAFE_MIN_ROAD_CONFIDENCE,
-    SAFE_ERROR_DEADBAND_MM,
-    SAFE_STEERING_GAIN,
-    SAFE_MAX_STEERING_CORRECTION,
-    USE_YELLOW_BOUNDARY_LOCK,
-    YELLOW_H_MIN,
-    YELLOW_H_MAX,
-    YELLOW_S_MIN,
-    YELLOW_S_MAX,
-    YELLOW_V_MIN,
-    YELLOW_V_MAX,
-    YELLOW_BOUNDARY_DILATE_PX,
-    YELLOW_MAX_CROSSING_PIXELS,
-    LANE_SIDE_HOLD_FRAMES,
-    USE_RIGHT_LANE_YELLOW_LOCK,
-    RIGHT_LANE_FROM_YELLOW,
-    YELLOW_LANE_SIDE,
-    YELLOW_LANE_SEARCH_MARGIN_PX,
-    YELLOW_MIN_PIXELS_PER_SCANLINE,
-    YELLOW_RIGHT_LANE_HOLD_FRAMES,
-    USE_NO_YELLOW_WIDE_BLOB_GATE,
-    NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO,
-    NO_YELLOW_MAX_MEASURED_WIDTH_MM,
-    ALLOW_NO_YELLOW_BLOB_SPLIT,
-    CAMERA_CENTER_X_RATIO,
-    CAMERA_CENTER_OFFSET_PX,
-    CAMERA_CENTER_OFFSET_MM,
-    MIN_CLEARANCE_MM,
-    MAX_REASONABLE_CORRIDOR_ERROR_MM,
-    MAX_REASONABLE_CLEARANCE_MM,
-    MAX_STEERING_SATURATION_FRAMES,
-    MAX_CENTER_JUMP_PX,
-    MIN_SEGMENT_WIDTH_PX,
-    REALSENSE_FPS,
-    REALSENSE_HEIGHT,
-    REALSENSE_WIDTH,
-    SCANLINE_COUNT,
-    SELECT_CONFIDENCE,
-    SELECT_MARGIN,
-    TRACKBAR_RANGES,
-    USE_EGO_CONNECTED_MASK,
-    WINDOW_MAIN,
-    WINDOW_MASK,
-    WINDOW_TUNING,
-)
+# ---------------------------------------------------------------------------
+# Runtime defaults
+# ---------------------------------------------------------------------------
+# The ROS2-ready detector is intentionally self-contained in this file. Camera
+# JSON files override these defaults, but keeping safe fallback values here
+# means image/video/webcam modes do not depend on a separate Python config
+# module.
+FRAME_WIDTH = 960
+FRAME_HEIGHT = 540
+REALSENSE_WIDTH = 848
+REALSENSE_HEIGHT = 480
+REALSENSE_FPS = 30
+
+WINDOW_MAIN = "QCar2 RGB Drift Helper"
+WINDOW_TUNING = "Tuning"
+WINDOW_MASK = "Road Mask Debug"
+CONFIG_FILE = "configs/csi_front_config.json"
+
+LANE_WIDTH_MM = 254.0
+CAR_WIDTH_MM = 203.2
+SIDEWALK_MARGIN_MM = 12.0
+LINE_MARGIN_MM = 12.0
+SAFE_HALLWAY_WIDTH_MM = CAR_WIDTH_MM + SIDEWALK_MARGIN_MM + LINE_MARGIN_MM
+
+DEFAULT_SETTINGS = {
+    "H_min": 0,
+    "H_max": 174,
+    "S_min": 0,
+    "S_max": 202,
+    "V_min": 0,
+    "V_max": 101,
+    "ROI_top_percent": 67,
+    "Morph_kernel": 1,
+    "Close_kernel": 1,
+    "Min_area_percent": 1,
+    "SCANLINE_COUNT": 12,
+    "MIN_SEGMENT_WIDTH_PX": 20,
+    "MAX_CENTER_JUMP_PX": 95,
+    "ALLOW_FIRST_ANCHOR_JUMP": True,
+    "USE_EGO_CONNECTED_MASK": True,
+    "EGO_SEED_X_RATIO": 0.50,
+    "EGO_SEED_Y_RATIO": 0.95,
+    "EGO_SEED_SEARCH_RADIUS_PX": 120,
+    "EGO_BOTTOM_BAND_PERCENT": 18,
+    "EGO_MIN_COMPONENT_AREA_PERCENT": 1.0,
+    "CENTERLINE_SMOOTHING_ALPHA": 0.45,
+    "LAST_CENTER_HOLD_FRAMES": 12,
+    "CENTER_DEADBAND_PX": 35,
+    "CENTER_STRONG_PX": 110,
+    "CURVE_DEADBAND_PX": 45,
+    "CURVE_STRONG_PX": 140,
+    "LANE_WIDTH_MM": LANE_WIDTH_MM,
+    "CAR_WIDTH_MM": CAR_WIDTH_MM,
+    "SIDEWALK_MARGIN_MM": SIDEWALK_MARGIN_MM,
+    "LINE_MARGIN_MM": LINE_MARGIN_MM,
+    "SAFE_HALLWAY_WIDTH_MM": SAFE_HALLWAY_WIDTH_MM,
+    "MIN_VALID_LANE_WIDTH_MM": 220.0,
+    "MAX_VALID_LANE_WIDTH_MM": 290.0,
+    "SAFE_SCANLINE_COUNT": 6,
+    "SAFE_SCANLINE_START_RATIO": 0.62,
+    "SAFE_SCANLINE_END_RATIO": 0.95,
+    "SAFE_SCANLINE_NEAR_WEIGHT_BIAS": 2.0,
+    "SAFE_MIN_VALID_SCANLINES": 4,
+    "SAFE_MIN_ROAD_CONFIDENCE": 0.55,
+    "SAFE_ERROR_DEADBAND_MM": 5.0,
+    "SAFE_STEERING_GAIN": 0.01,
+    "SAFE_MAX_STEERING_CORRECTION": 0.20,
+    "USE_YELLOW_BOUNDARY_LOCK": True,
+    "YELLOW_H_MIN": 18,
+    "YELLOW_H_MAX": 45,
+    "YELLOW_S_MIN": 80,
+    "YELLOW_S_MAX": 255,
+    "YELLOW_V_MIN": 80,
+    "YELLOW_V_MAX": 255,
+    "YELLOW_BOUNDARY_DILATE_PX": 7,
+    "YELLOW_MAX_CROSSING_PIXELS": 20,
+    "LANE_SIDE_HOLD_FRAMES": 15,
+    "USE_RIGHT_LANE_YELLOW_LOCK": True,
+    "RIGHT_LANE_FROM_YELLOW": True,
+    "YELLOW_LANE_SIDE": "right",
+    "YELLOW_LANE_SEARCH_MARGIN_PX": 8,
+    "YELLOW_MIN_PIXELS_PER_SCANLINE": 3,
+    "YELLOW_RIGHT_LANE_HOLD_FRAMES": 20,
+    "USE_NO_YELLOW_WIDE_BLOB_GATE": True,
+    "NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO": 0.55,
+    "NO_YELLOW_MAX_MEASURED_WIDTH_MM": 310.0,
+    "ALLOW_NO_YELLOW_BLOB_SPLIT": False,
+    "CAMERA_CENTER_X_RATIO": 0.50,
+    "CAMERA_CENTER_OFFSET_PX": 0,
+    "CAMERA_CENTER_OFFSET_MM": 0.0,
+    "MIN_CLEARANCE_MM": 0.0,
+    "MAX_REASONABLE_CORRIDOR_ERROR_MM": 75.0,
+    "MAX_REASONABLE_CLEARANCE_MM": 80.0,
+    "MAX_STEERING_SATURATION_FRAMES": 15,
+    "DRIFT_HELPER_ONLY_ON_STRAIGHT": True,
+    "DRIFT_MAX_ABS_CURVE_ERROR_PX": 35,
+    "DRIFT_MAX_ABS_CORRIDOR_ERROR_MM": 40,
+    "DRIFT_MIN_SAFE_CORRIDOR_VALID_FRAMES": 3,
+    "DRIFT_DISABLE_ON_TURN_HINT": True,
+    "DRIFT_HELPER_GAIN": 0.01,
+    "DRIFT_HELPER_MAX_OUTPUT": 0.20,
+}
+
+TRACKBAR_RANGES = {
+    "H_min": 179,
+    "H_max": 179,
+    "S_min": 255,
+    "S_max": 255,
+    "V_min": 255,
+    "V_max": 255,
+    "ROI_top_percent": 80,
+    "Morph_kernel": 31,
+    "Close_kernel": 51,
+    "Min_area_percent": 30,
+}
+
+SCANLINE_COUNT = DEFAULT_SETTINGS["SCANLINE_COUNT"]
+MIN_SEGMENT_WIDTH_PX = DEFAULT_SETTINGS["MIN_SEGMENT_WIDTH_PX"]
+MAX_CENTER_JUMP_PX = DEFAULT_SETTINGS["MAX_CENTER_JUMP_PX"]
+ALLOW_FIRST_ANCHOR_JUMP = DEFAULT_SETTINGS["ALLOW_FIRST_ANCHOR_JUMP"]
+USE_EGO_CONNECTED_MASK = DEFAULT_SETTINGS["USE_EGO_CONNECTED_MASK"]
+EGO_SEED_X_RATIO = DEFAULT_SETTINGS["EGO_SEED_X_RATIO"]
+EGO_SEED_Y_RATIO = DEFAULT_SETTINGS["EGO_SEED_Y_RATIO"]
+EGO_SEED_SEARCH_RADIUS_PX = DEFAULT_SETTINGS["EGO_SEED_SEARCH_RADIUS_PX"]
+EGO_BOTTOM_BAND_PERCENT = DEFAULT_SETTINGS["EGO_BOTTOM_BAND_PERCENT"]
+EGO_MIN_COMPONENT_AREA_PERCENT = DEFAULT_SETTINGS["EGO_MIN_COMPONENT_AREA_PERCENT"]
+CENTERLINE_SMOOTHING_ALPHA = DEFAULT_SETTINGS["CENTERLINE_SMOOTHING_ALPHA"]
+LAST_CENTER_HOLD_FRAMES = DEFAULT_SETTINGS["LAST_CENTER_HOLD_FRAMES"]
+CENTER_DEADBAND_PX = DEFAULT_SETTINGS["CENTER_DEADBAND_PX"]
+CENTER_STRONG_PX = DEFAULT_SETTINGS["CENTER_STRONG_PX"]
+CURVE_DEADBAND_PX = DEFAULT_SETTINGS["CURVE_DEADBAND_PX"]
+CURVE_STRONG_PX = DEFAULT_SETTINGS["CURVE_STRONG_PX"]
+MIN_VALID_LANE_WIDTH_MM = DEFAULT_SETTINGS["MIN_VALID_LANE_WIDTH_MM"]
+MAX_VALID_LANE_WIDTH_MM = DEFAULT_SETTINGS["MAX_VALID_LANE_WIDTH_MM"]
+SAFE_SCANLINE_COUNT = DEFAULT_SETTINGS["SAFE_SCANLINE_COUNT"]
+SAFE_SCANLINE_START_RATIO = DEFAULT_SETTINGS["SAFE_SCANLINE_START_RATIO"]
+SAFE_SCANLINE_END_RATIO = DEFAULT_SETTINGS["SAFE_SCANLINE_END_RATIO"]
+SAFE_SCANLINE_NEAR_WEIGHT_BIAS = DEFAULT_SETTINGS["SAFE_SCANLINE_NEAR_WEIGHT_BIAS"]
+SAFE_MIN_VALID_SCANLINES = DEFAULT_SETTINGS["SAFE_MIN_VALID_SCANLINES"]
+SAFE_MIN_ROAD_CONFIDENCE = DEFAULT_SETTINGS["SAFE_MIN_ROAD_CONFIDENCE"]
+SAFE_ERROR_DEADBAND_MM = DEFAULT_SETTINGS["SAFE_ERROR_DEADBAND_MM"]
+SAFE_STEERING_GAIN = DEFAULT_SETTINGS["SAFE_STEERING_GAIN"]
+SAFE_MAX_STEERING_CORRECTION = DEFAULT_SETTINGS["SAFE_MAX_STEERING_CORRECTION"]
+USE_YELLOW_BOUNDARY_LOCK = DEFAULT_SETTINGS["USE_YELLOW_BOUNDARY_LOCK"]
+YELLOW_H_MIN = DEFAULT_SETTINGS["YELLOW_H_MIN"]
+YELLOW_H_MAX = DEFAULT_SETTINGS["YELLOW_H_MAX"]
+YELLOW_S_MIN = DEFAULT_SETTINGS["YELLOW_S_MIN"]
+YELLOW_S_MAX = DEFAULT_SETTINGS["YELLOW_S_MAX"]
+YELLOW_V_MIN = DEFAULT_SETTINGS["YELLOW_V_MIN"]
+YELLOW_V_MAX = DEFAULT_SETTINGS["YELLOW_V_MAX"]
+YELLOW_BOUNDARY_DILATE_PX = DEFAULT_SETTINGS["YELLOW_BOUNDARY_DILATE_PX"]
+YELLOW_MAX_CROSSING_PIXELS = DEFAULT_SETTINGS["YELLOW_MAX_CROSSING_PIXELS"]
+LANE_SIDE_HOLD_FRAMES = DEFAULT_SETTINGS["LANE_SIDE_HOLD_FRAMES"]
+USE_RIGHT_LANE_YELLOW_LOCK = DEFAULT_SETTINGS["USE_RIGHT_LANE_YELLOW_LOCK"]
+RIGHT_LANE_FROM_YELLOW = DEFAULT_SETTINGS["RIGHT_LANE_FROM_YELLOW"]
+YELLOW_LANE_SIDE = DEFAULT_SETTINGS["YELLOW_LANE_SIDE"]
+YELLOW_LANE_SEARCH_MARGIN_PX = DEFAULT_SETTINGS["YELLOW_LANE_SEARCH_MARGIN_PX"]
+YELLOW_MIN_PIXELS_PER_SCANLINE = DEFAULT_SETTINGS["YELLOW_MIN_PIXELS_PER_SCANLINE"]
+YELLOW_RIGHT_LANE_HOLD_FRAMES = DEFAULT_SETTINGS["YELLOW_RIGHT_LANE_HOLD_FRAMES"]
+USE_NO_YELLOW_WIDE_BLOB_GATE = DEFAULT_SETTINGS["USE_NO_YELLOW_WIDE_BLOB_GATE"]
+NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO = DEFAULT_SETTINGS["NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO"]
+NO_YELLOW_MAX_MEASURED_WIDTH_MM = DEFAULT_SETTINGS["NO_YELLOW_MAX_MEASURED_WIDTH_MM"]
+ALLOW_NO_YELLOW_BLOB_SPLIT = DEFAULT_SETTINGS["ALLOW_NO_YELLOW_BLOB_SPLIT"]
+CAMERA_CENTER_X_RATIO = DEFAULT_SETTINGS["CAMERA_CENTER_X_RATIO"]
+CAMERA_CENTER_OFFSET_PX = DEFAULT_SETTINGS["CAMERA_CENTER_OFFSET_PX"]
+CAMERA_CENTER_OFFSET_MM = DEFAULT_SETTINGS["CAMERA_CENTER_OFFSET_MM"]
+MIN_CLEARANCE_MM = DEFAULT_SETTINGS["MIN_CLEARANCE_MM"]
+MAX_REASONABLE_CORRIDOR_ERROR_MM = DEFAULT_SETTINGS["MAX_REASONABLE_CORRIDOR_ERROR_MM"]
+MAX_REASONABLE_CLEARANCE_MM = DEFAULT_SETTINGS["MAX_REASONABLE_CLEARANCE_MM"]
+MAX_STEERING_SATURATION_FRAMES = DEFAULT_SETTINGS["MAX_STEERING_SATURATION_FRAMES"]
 
 WINDOW_VIDEO_CONTROL = "Video Control"
-MANUAL_TUNING_NOTE = "Manual video tuning baseline for future auto-tuning"
-AUTO_TUNING_NOTE = (
-    "This config should be used as the center/seed for the future auto-tuning search. "
-    "Auto-tuning should explore small ranges around these values first."
-)
+MANUAL_TUNING_NOTE = "Manual video tuning baseline for the RGB drift helper"
 OPTIONAL_TRACKBAR_RANGES = {
     # Planning-mask controls are not used yet. If they are added to
     # DEFAULT_SETTINGS later, these ranges let manual tuning expose them
@@ -212,7 +302,7 @@ class RealSenseSource(ImageSource):
         except ImportError as exc:
             raise RuntimeError(
                 "pyrealsense2 is not installed. Install it with "
-                "'py -3.12 -m pip install pyrealsense2', or use "
+                "'py -3.13 -m pip install pyrealsense2', or use "
                 "'--source webcam' / '--source image'."
             ) from exc
 
@@ -245,103 +335,25 @@ class RealSenseSource(ImageSource):
         self.pipeline.stop()
 
 
-class PathConfidenceTracker:
-    def __init__(self):
-        self.confidences = {"left": 0.33, "straight": 0.34, "right": 0.33}
-        self.smoothed_curve_error_px = None
+def compute_turn_hint(curve_error_px, detector_config=None):
+    """Return a simple curve hint for safety gating, not path planning.
 
-    def update(self, center_error_px: float | None, curve_error_px: float | None, road_detected: bool):
-        target = {"left": 0.33, "straight": 0.34, "right": 0.33}
-
-        if road_detected and curve_error_px is not None:
-            curve = float(curve_error_px)
-            if self.smoothed_curve_error_px is None:
-                self.smoothed_curve_error_px = curve
-            else:
-                self.smoothed_curve_error_px = (
-                    (1.0 - CENTERLINE_ALPHA) * self.smoothed_curve_error_px
-                    + CENTERLINE_ALPHA * curve
-                )
-        elif not road_detected:
-            self.smoothed_curve_error_px = None
-
-        if road_detected and self.smoothed_curve_error_px is not None:
-            curve = self.smoothed_curve_error_px
-            abs_curve = abs(curve)
-
-            # curve_error_px is the far road center minus the near road center.
-            # Negative means the visible road bends left; positive means it bends right.
-            if abs_curve <= CURVE_DEADBAND_PX:
-                target = {"left": 0.07, "straight": 0.86, "right": 0.07}
-            elif curve < -CURVE_STRONG_PX:
-                target = {"left": 0.86, "straight": 0.08, "right": 0.06}
-            elif curve > CURVE_STRONG_PX:
-                target = {"left": 0.06, "straight": 0.08, "right": 0.86}
-            elif curve < 0:
-                amount = min(1.0, (abs_curve - CURVE_DEADBAND_PX) / max(1, CURVE_STRONG_PX - CURVE_DEADBAND_PX))
-                target = {
-                    "left": 0.38 + 0.36 * amount,
-                    "straight": 0.48 - 0.26 * amount,
-                    "right": 0.14 - 0.10 * amount,
-                }
-            else:
-                amount = min(1.0, (abs_curve - CURVE_DEADBAND_PX) / max(1, CURVE_STRONG_PX - CURVE_DEADBAND_PX))
-                target = {
-                    "left": 0.14 - 0.10 * amount,
-                    "straight": 0.48 - 0.26 * amount,
-                    "right": 0.38 + 0.36 * amount,
-                }
-
-            if center_error_px is not None:
-                target = self.apply_lateral_correction(target, center_error_px)
-
-        for name in self.confidences:
-            old_value = self.confidences[name]
-            self.confidences[name] = (1.0 - CONFIDENCE_ALPHA) * old_value + CONFIDENCE_ALPHA * target[name]
-
-        total = sum(self.confidences.values())
-        if total > 0:
-            for name in self.confidences:
-                self.confidences[name] /= total
-
-        return self.confidences.copy(), self.selected_path(), self.smoothed_curve_error_px, self.turn_hint()
-
-    def apply_lateral_correction(self, target, center_error_px):
-        # road_center_error_px is the detected road center minus the image center.
-        # Negative means the drivable corridor is left of the camera; positive means right.
-        correction = min(0.12, abs(center_error_px) / max(1, CENTER_STRONG_PX) * 0.12)
-        if abs(center_error_px) <= CENTER_DEADBAND_PX:
-            return target
-        if center_error_px < 0:
-            target["left"] += correction
-            target["right"] = max(0.02, target["right"] - correction)
-        else:
-            target["right"] += correction
-            target["left"] = max(0.02, target["left"] - correction)
-
-        total = sum(target.values())
-        return {name: value / total for name, value in target.items()}
-
-    def turn_hint(self):
-        if self.smoothed_curve_error_px is None:
-            return "unknown"
-        if self.smoothed_curve_error_px < -CURVE_DEADBAND_PX:
-            return "left"
-        if self.smoothed_curve_error_px > CURVE_DEADBAND_PX:
-            return "right"
-        return "straight"
-
-    def selected_path(self):
-        ordered = sorted(self.confidences.items(), key=lambda item: item[1], reverse=True)
-        best_name, best_value = ordered[0]
-        second_value = ordered[1][1]
-        if best_value > SELECT_CONFIDENCE and best_value - second_value >= SELECT_MARGIN:
-            return best_name
-        return "none"
+    The visual helper is drift-only. A left/right turn hint disables the helper
+    so the normal QCar2 controller can handle turns, intersections, and route
+    choices without camera-helper guesses.
+    """
+    if curve_error_px is None:
+        return "unknown"
+    deadband = cfg_float(detector_config, "CURVE_DEADBAND_PX", CURVE_DEADBAND_PX)
+    if curve_error_px < -deadband:
+        return "left"
+    if curve_error_px > deadband:
+        return "right"
+    return "straight"
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="RGB-only QCar2 road/drivable-area detection prototype.")
+    parser = argparse.ArgumentParser(description="RGB-only QCar2 drift-helper detector.")
     parser.add_argument("--source", choices=["image", "webcam", "realsense", "video"], required=True)
     parser.add_argument("--image", help="Path to a static image for --source image.")
     parser.add_argument("--video", help="Path to a video file for --source video.")
@@ -353,25 +365,17 @@ def parse_args():
         action="store_true",
         help="Open an interactive manual tuning mode for --source video instead of full analysis.",
     )
-    parser.add_argument("--auto-tune", action="store_true", help="Run offline OpenCV/NumPy hyperparameter search.")
-    parser.add_argument("--seed-config", default="configs/manual_tuned_config.json", help="Config JSON used as the auto-tune search center.")
-    parser.add_argument("--quick", action="store_true", help="Use fewer candidates and wider frame stride for a fast auto-tune smoke test.")
-    parser.add_argument("--max-configs", type=int, default=500, help="Maximum candidate configs for sampled-frame auto-tuning.")
-    parser.add_argument("--top-k", type=int, default=10, help="Number of sampled-frame top configs to save.")
-    parser.add_argument("--sample-stride", type=int, default=10, help="Process every Nth frame during sampled auto-tune search.")
-    parser.add_argument("--full-eval-top-k", type=int, default=5, help="Number of top configs to evaluate on the full video.")
-    parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducible candidate generation.")
-    parser.add_argument("--auto-tune-time-budget-hours", type=float, default=0.0, help="Optional wall-clock budget. 0 means use --max-configs.")
     parser.add_argument(
         "--use-default-config",
         action="store_true",
-        help="Use DEFAULT_SETTINGS from config.py for video mode and ignore road_config.json.",
+        help="Use built-in defaults instead of loading the camera JSON.",
     )
     parser.add_argument(
         "--config",
-        help="Config JSON to load. Video analysis defaults to road_config.json when it exists; tuning mode loads only explicit paths.",
+        default=CONFIG_FILE,
+        help="Camera config JSON to load. Defaults to configs/csi_front_config.json.",
     )
-    parser.add_argument("--config-output", default="configs/manual_tuned_config.json", help="Where manual video tuning saves the baseline config.")
+    parser.add_argument("--config-output", help="Where manual video tuning saves settings. Defaults to --config.")
     parser.add_argument("--session-output", default="configs/manual_tuning_session.json", help="Where manual video tuning saves session notes and sample frame lists.")
     parser.add_argument("--start-frame", type=int, default=0, help="Frame index where manual video tuning starts.")
     parser.add_argument("--playback-speed", type=float, default=1.0, help="Manual tuning playback speed multiplier.")
@@ -404,7 +408,7 @@ def print_startup(args):
     print("QCar2 RGB Road Detector")
     print("-----------------------")
     print(f"Source: {args.source}")
-    print("Keys: q/ESC quit | s save HSV | l load HSV | r reset HSV | m mask | p pause | c secondary candidates")
+    print("Keys: q/ESC quit | s save HSV | l load HSV | r reset HSV | m mask | p pause")
     print("Tune HSV until road is white in the mask and non-road is black.")
     print()
 
@@ -440,9 +444,9 @@ def nothing(_value):
     pass
 
 
-def get_trackbar_settings():
-    settings = {}
-    for name in DEFAULT_SETTINGS:
+def get_trackbar_settings(base_settings=None):
+    settings = (base_settings or DEFAULT_SETTINGS).copy()
+    for name in TRACKBAR_RANGES:
         try:
             settings[name] = cv2.getTrackbarPos(name, WINDOW_TUNING)
         except cv2.error:
@@ -485,19 +489,33 @@ def save_settings(settings):
     print(f"Saved HSV settings to {CONFIG_FILE}")
 
 
-def load_settings():
-    if not os.path.exists(CONFIG_FILE):
-        print(f"No {CONFIG_FILE} found yet.")
+def config_values_from_payload(payload):
+    """Extract runtime detector values from either flat or metadata JSON."""
+    values = payload.get("settings", payload.get("config", payload))
+    settings = DEFAULT_SETTINGS.copy()
+    if "camera_type" in payload:
+        settings["camera_type"] = payload["camera_type"]
+    if "name" in payload:
+        settings["config_name"] = payload["name"]
+    for name, default in DEFAULT_SETTINGS.items():
+        if name in values:
+            settings[name] = values[name] if isinstance(default, str) else type(default)(values[name])
+    for name in TRACKBAR_RANGES:
+        if name in values:
+            settings[name] = int(values[name])
+    return settings
+
+
+def load_settings(config_path=CONFIG_FILE):
+    if not config_path or not os.path.exists(config_path):
+        print(f"No config found at {config_path}. Using built-in defaults.")
         return None
 
-    with open(CONFIG_FILE, "r", encoding="utf-8") as file:
+    with open(config_path, "r", encoding="utf-8") as file:
         loaded = json.load(file)
 
-    settings = DEFAULT_SETTINGS.copy()
-    for name in settings:
-        if name in loaded:
-            settings[name] = int(loaded[name])
-    print(f"Loaded HSV settings from {CONFIG_FILE}")
+    settings = config_values_from_payload(loaded)
+    print(f"Loaded detector settings from {config_path}")
     return settings
 
 
@@ -506,8 +524,8 @@ def clamp(value, minimum, maximum):
 
 
 def cfg_value(detector_config, name, default):
-    # Auto-tuning passes candidate values in a runtime dict. Normal live/video
-    # modes leave detector_config as None and use config.py defaults.
+    # Camera JSON files pass runtime values in a dictionary. Missing values use
+    # the conservative defaults above so older tuning files still run.
     if detector_config is not None and name in detector_config:
         return detector_config[name]
     return default
@@ -1300,6 +1318,60 @@ def apply_steering_saturation_gate(safe_corridor, safe_corridor_state, detector_
         safe_corridor["safe_corridor_reason"] = "steering_saturated_too_long"
 
 
+def apply_drift_only_gate(result, turn_hint, drift_state, detector_config=None):
+    """Clamp the camera helper to drift correction in straight-ish corridors.
+
+    The normal QCar2 controller remains in charge. This helper only nudges
+    lateral drift when the blue corridor is physically valid and the road is
+    not turning. Any uncertain condition disables the helper and forces the
+    correction to exactly zero.
+    """
+    if drift_state is None:
+        drift_state = {}
+
+    if not result.safe_corridor_valid:
+        drift_state["valid_frames"] = 0
+        result.visual_helper_active = False
+        result.visual_steering_correction = 0.0
+        if result.safe_corridor_reason == "valid":
+            result.safe_corridor_reason = "safe_corridor_invalid"
+        return
+
+    drift_state["valid_frames"] = drift_state.get("valid_frames", 0) + 1
+    min_valid_frames = cfg_int(detector_config, "DRIFT_MIN_SAFE_CORRIDOR_VALID_FRAMES", 3)
+    if drift_state["valid_frames"] < min_valid_frames:
+        result.visual_helper_active = False
+        result.visual_steering_correction = 0.0
+        result.safe_corridor_reason = "waiting_for_stable_corridor"
+        return
+
+    if bool(cfg_value(detector_config, "DRIFT_DISABLE_ON_TURN_HINT", True)) and turn_hint in ("left", "right"):
+        result.visual_helper_active = False
+        result.visual_steering_correction = 0.0
+        result.safe_corridor_reason = "turning_helper_disabled"
+        return
+
+    max_curve = cfg_float(detector_config, "DRIFT_MAX_ABS_CURVE_ERROR_PX", 35.0)
+    if bool(cfg_value(detector_config, "DRIFT_HELPER_ONLY_ON_STRAIGHT", True)):
+        if result.curve_error_px is not None and abs(result.curve_error_px) > max_curve:
+            result.visual_helper_active = False
+            result.visual_steering_correction = 0.0
+            result.safe_corridor_reason = "curve_error_too_high"
+            return
+
+    max_error_mm = cfg_float(detector_config, "DRIFT_MAX_ABS_CORRIDOR_ERROR_MM", 40.0)
+    if result.corridor_center_error_mm is None or abs(result.corridor_center_error_mm) > max_error_mm:
+        result.visual_helper_active = False
+        result.visual_steering_correction = 0.0
+        result.safe_corridor_reason = "corridor_error_too_high"
+        return
+
+    gain = cfg_float(detector_config, "DRIFT_HELPER_GAIN", cfg_float(detector_config, "SAFE_STEERING_GAIN", SAFE_STEERING_GAIN))
+    max_output = cfg_float(detector_config, "DRIFT_HELPER_MAX_OUTPUT", cfg_float(detector_config, "SAFE_MAX_STEERING_CORRECTION", SAFE_MAX_STEERING_CORRECTION))
+    result.visual_helper_active = True
+    result.visual_steering_correction = clamp(gain * result.corridor_center_error_mm, -max_output, max_output)
+
+
 def count_safe_corridor_yellow_crossing(safe_rows, yellow_boundary_mask, height, width):
     if yellow_boundary_mask is None or not safe_rows:
         return 0
@@ -1426,40 +1498,7 @@ def smooth_centerline_points(raw_points, detector_config=None):
     return smoothed_points
 
 
-def make_candidates(width, height):
-    start = np.array([width // 2, height - 20], dtype=np.int32)
-    return {
-        "left": np.array(
-            [
-                start,
-                [int(width * 0.46), int(height * 0.78)],
-                [int(width * 0.35), int(height * 0.62)],
-                [int(width * 0.24), int(height * 0.48)],
-            ],
-            dtype=np.int32,
-        ),
-        "straight": np.array(
-            [
-                start,
-                [int(width * 0.50), int(height * 0.78)],
-                [int(width * 0.50), int(height * 0.62)],
-                [int(width * 0.50), int(height * 0.46)],
-            ],
-            dtype=np.int32,
-        ),
-        "right": np.array(
-            [
-                start,
-                [int(width * 0.54), int(height * 0.78)],
-                [int(width * 0.65), int(height * 0.62)],
-                [int(width * 0.76), int(height * 0.48)],
-            ],
-            dtype=np.int32,
-        ),
-    }
-
-
-def draw_visualization(frame, result, confidences, selected_path, smoothed_curve_error_px, turn_hint, show_candidates):
+def draw_visualization(frame, result, turn_hint):
     output = frame.copy()
     height, width = output.shape[:2]
 
@@ -1470,16 +1509,13 @@ def draw_visualization(frame, result, confidences, selected_path, smoothed_curve
     for left_x, y in result.boundary_points:
         cv2.circle(output, (left_x, y), 4, (0, 255, 255), -1)
 
-    if show_candidates:
-        draw_candidate_paths(output, confidences, selected_path)
-
     draw_detected_centerline(output, result)
     draw_safe_corridor(output, result)
     draw_yellow_boundary(output, result)
     draw_ego_anchor_debug(output, result)
     cv2.line(output, (width // 2, height), (width // 2, int(height * 0.45)), (255, 255, 255), 1)
 
-    draw_debug_text(output, result, confidences, selected_path, smoothed_curve_error_px, turn_hint)
+    draw_debug_text(output, result, turn_hint)
     return output
 
 
@@ -1555,22 +1591,6 @@ def draw_yellow_boundary(output, result):
         cv2.putText(output, "WIDE BLOB NO YELLOW - HELPER OFF", (output.shape[1] - 520, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 255), 2, cv2.LINE_AA)
 
 
-def draw_candidate_paths(output, confidences, selected_path):
-    height, width = output.shape[:2]
-    candidates = make_candidates(width, height)
-    for name, points in candidates.items():
-        confidence = confidences[name]
-        if name == selected_path:
-            color = (80, 220, 255)
-            thickness = 3
-        else:
-            brightness = int(45 + 80 * confidence)
-            color = (brightness, brightness, 150)
-            thickness = 2
-        cv2.polylines(output, [points], False, color, thickness, cv2.LINE_AA)
-        cv2.circle(output, tuple(points[-1]), 4, color, -1)
-
-
 def draw_detected_centerline(output, result):
     if not result.scan_points:
         return
@@ -1602,10 +1622,10 @@ def draw_detected_centerline(output, result):
         cv2.circle(output, (x, y), 5, (0, 255, 0), -1)
 
 
-def draw_debug_text(output, result, confidences, selected_path, smoothed_curve_error_px, turn_hint):
+def draw_debug_text(output, result, turn_hint):
     error = result.road_center_error_px
     error_text = "None" if error is None else f"{error:.1f}"
-    curve_text = "None" if smoothed_curve_error_px is None else f"{smoothed_curve_error_px:.1f}"
+    curve_text = "None" if result.curve_error_px is None else f"{result.curve_error_px:.1f}"
     near_text = "None" if result.near_center_x is None else str(result.near_center_x)
     far_text = "None" if result.far_center_x is None else str(result.far_center_x)
     lines = [
@@ -1636,10 +1656,6 @@ def draw_debug_text(output, result, confidences, selected_path, smoothed_curve_e
         f"yellow_cross_px: {result.yellow_crossing_pixels}",
         f"right_lane_lock: {result.right_lane_lock_active}",
         f"right_lane_reason: {result.right_lane_lock_reason}",
-        f"selected_path(debug): {selected_path}",
-        f"straight_confidence: {confidences['straight']:.2f}",
-        f"left_confidence: {confidences['left']:.2f}",
-        f"right_confidence: {confidences['right']:.2f}",
     ]
 
     x = 12
@@ -1667,7 +1683,7 @@ def build_display_grid(original, result, visualization):
     road_overlay = build_road_overlay(original, result)
 
     top = np.hstack([label_image(original, "Original RGB"), label_image(mask_bgr, "Road Mask")])
-    bottom = np.hstack([label_image(road_overlay, "Road Overlay"), label_image(visualization, "Detected Center Path")])
+    bottom = np.hstack([label_image(road_overlay, "Road Overlay"), label_image(visualization, "Safe Corridor Debug")])
     grid = np.vstack([top, bottom])
     return cv2.resize(grid, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
 
@@ -1695,8 +1711,6 @@ def handle_key(key, settings):
         return "toggle_mask"
     elif key == ord("p"):
         return "toggle_pause"
-    elif key == ord("c"):
-        return "toggle_candidates"
     return None
 
 
@@ -1745,16 +1759,7 @@ def create_output_folders(output_dir, base_name, clean_output=False):
 def load_settings_file(path):
     with open(path, "r", encoding="utf-8") as file:
         loaded = json.load(file)
-    if "config" in loaded and isinstance(loaded["config"], dict):
-        loaded = loaded["config"]
-
-    settings = DEFAULT_SETTINGS.copy()
-    for name, value in loaded.items():
-        if isinstance(value, (int, float)):
-            settings[name] = value
-    for name in DEFAULT_SETTINGS:
-        settings[name] = int(settings[name])
-    return settings
+    return config_values_from_payload(loaded)
 
 
 def load_video_settings(args):
@@ -1767,10 +1772,7 @@ def load_video_settings(args):
         print(f"Loaded HSV settings from {source}")
         return load_settings_file(config_path), source
 
-    if args.config is not None:
-        raise RuntimeError(f"Could not find config file: {config_path}")
-
-    return DEFAULT_SETTINGS.copy(), "DEFAULT_SETTINGS"
+    raise RuntimeError(f"Could not find config file: {config_path}")
 
 
 def load_manual_tuning_settings(args):
@@ -1787,8 +1789,8 @@ def load_manual_tuning_settings(args):
 
 
 def create_manual_tuning_folders():
-    # Good and difficult samples become visual evidence for the future
-    # auto-tuner, so they live in stable folders instead of per-analysis runs.
+    # Good and difficult samples become visual evidence for future camera
+    # retuning, so they live in stable folders instead of per-analysis runs.
     root = Path("outputs") / "manual_tuning"
     folders = {
         "root": root,
@@ -1804,10 +1806,18 @@ def create_manual_tuning_folders():
 
 def save_manual_tuning_config(path, settings, source_video, frame_index):
     # HSV controls select which colors count as road. ROI/morphology controls
-    # clean that mask. This saved file is the human-picked seed for later
-    # self-tuning, so the optimizer can search near a reasonable baseline.
-    payload = {name: int(settings[name]) for name in DEFAULT_SETTINGS}
-    payload.update(
+    # clean that mask. The saved JSON also carries physical helper settings so
+    # the same file can be used later by the ROS2 node.
+    path = Path(path)
+    payload = {
+        "name": path.stem,
+        "camera_type": "csi_front" if "csi" in str(path).lower() else "rgb",
+        "created_from": "manual_tuning",
+        "notes": "Manual tuning baseline for the RGB drift helper.",
+        "units": "mm",
+        "settings": settings.copy(),
+    }
+    payload["settings"].update(
         {
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "source_video": str(source_video),
@@ -1815,7 +1825,6 @@ def save_manual_tuning_config(path, settings, source_video, frame_index):
             "note": MANUAL_TUNING_NOTE,
         }
     )
-    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as file:
         json.dump(payload, file, indent=2)
@@ -1824,7 +1833,7 @@ def save_manual_tuning_config(path, settings, source_video, frame_index):
 
 def save_manual_tuning_session(path, source_video, last_saved_frame_index, config_output_path, session, settings):
     # The session file records which frames were useful during manual tuning.
-    # Future auto-tuning can replay those frames before trying larger searches.
+    # That makes later CSI/RealSense retuning easier to repeat.
     payload = {
         "source_video": str(source_video),
         "last_saved_frame_index": last_saved_frame_index,
@@ -1832,8 +1841,8 @@ def save_manual_tuning_session(path, source_video, last_saved_frame_index, confi
         "good_sample_frames": session["good_sample_frames"],
         "difficult_sample_frames": session["difficult_sample_frames"],
         "debug_snapshot_frames": session["debug_snapshot_frames"],
-        "final_config": {name: int(settings[name]) for name in DEFAULT_SETTINGS},
-        "notes_for_auto_tuning": AUTO_TUNING_NOTE,
+        "final_config": {name: value for name, value in settings.items() if is_json_scalar(value)},
+        "notes_for_retuning": "Use these saved frames when checking future CSI or RealSense camera adjustments.",
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1843,7 +1852,7 @@ def save_manual_tuning_session(path, source_video, last_saved_frame_index, confi
 
 def save_tuning_sample(kind, folders, frame_index, frame, result, overlay, debug_frame):
     # Good samples show frames where the current mask works well. Difficult
-    # samples show where tuning or the future auto-tuner still needs attention.
+    # samples show where manual tuning still needs attention.
     if kind == "good":
         folder = folders["good_samples"]
         frame_list_name = "good_sample_frames"
@@ -1885,77 +1894,8 @@ def update_video_control_trackbar(frame_index, total_frames):
 
 
 def get_config_used(settings, config_source=None):
-    config = {
-        "config_source": config_source,
-        "H_min": settings["H_min"],
-        "H_max": settings["H_max"],
-        "S_min": settings["S_min"],
-        "S_max": settings["S_max"],
-        "V_min": settings["V_min"],
-        "V_max": settings["V_max"],
-        "ROI_top_percent": settings["ROI_top_percent"],
-        "Morph_kernel": settings["Morph_kernel"],
-        "Close_kernel": settings["Close_kernel"],
-        "Min_area_percent": settings["Min_area_percent"],
-        "MIN_SEGMENT_WIDTH_PX": MIN_SEGMENT_WIDTH_PX,
-        "MAX_CENTER_JUMP_PX": MAX_CENTER_JUMP_PX,
-        "ALLOW_FIRST_ANCHOR_JUMP": ALLOW_FIRST_ANCHOR_JUMP,
-        "USE_EGO_CONNECTED_MASK": USE_EGO_CONNECTED_MASK,
-        "EGO_SEED_X_RATIO": EGO_SEED_X_RATIO,
-        "EGO_SEED_Y_RATIO": EGO_SEED_Y_RATIO,
-        "EGO_SEED_SEARCH_RADIUS_PX": EGO_SEED_SEARCH_RADIUS_PX,
-        "EGO_BOTTOM_BAND_PERCENT": EGO_BOTTOM_BAND_PERCENT,
-        "EGO_MIN_COMPONENT_AREA_PERCENT": EGO_MIN_COMPONENT_AREA_PERCENT,
-        "LANE_WIDTH_MM": LANE_WIDTH_MM,
-        "CAR_WIDTH_MM": CAR_WIDTH_MM,
-        "SIDEWALK_MARGIN_MM": SIDEWALK_MARGIN_MM,
-        "LINE_MARGIN_MM": LINE_MARGIN_MM,
-        "SAFE_HALLWAY_WIDTH_MM": SAFE_HALLWAY_WIDTH_MM,
-        "MIN_VALID_LANE_WIDTH_MM": MIN_VALID_LANE_WIDTH_MM,
-        "MAX_VALID_LANE_WIDTH_MM": MAX_VALID_LANE_WIDTH_MM,
-        "SAFE_SCANLINE_COUNT": SAFE_SCANLINE_COUNT,
-        "SAFE_SCANLINE_START_RATIO": SAFE_SCANLINE_START_RATIO,
-        "SAFE_SCANLINE_END_RATIO": SAFE_SCANLINE_END_RATIO,
-        "SAFE_SCANLINE_NEAR_WEIGHT_BIAS": SAFE_SCANLINE_NEAR_WEIGHT_BIAS,
-        "SAFE_MIN_VALID_SCANLINES": SAFE_MIN_VALID_SCANLINES,
-        "SAFE_MIN_ROAD_CONFIDENCE": SAFE_MIN_ROAD_CONFIDENCE,
-        "SAFE_ERROR_DEADBAND_MM": SAFE_ERROR_DEADBAND_MM,
-        "SAFE_STEERING_GAIN": SAFE_STEERING_GAIN,
-        "SAFE_MAX_STEERING_CORRECTION": SAFE_MAX_STEERING_CORRECTION,
-        "USE_YELLOW_BOUNDARY_LOCK": USE_YELLOW_BOUNDARY_LOCK,
-        "YELLOW_H_MIN": YELLOW_H_MIN,
-        "YELLOW_H_MAX": YELLOW_H_MAX,
-        "YELLOW_S_MIN": YELLOW_S_MIN,
-        "YELLOW_S_MAX": YELLOW_S_MAX,
-        "YELLOW_V_MIN": YELLOW_V_MIN,
-        "YELLOW_V_MAX": YELLOW_V_MAX,
-        "YELLOW_BOUNDARY_DILATE_PX": YELLOW_BOUNDARY_DILATE_PX,
-        "YELLOW_MAX_CROSSING_PIXELS": YELLOW_MAX_CROSSING_PIXELS,
-        "LANE_SIDE_HOLD_FRAMES": LANE_SIDE_HOLD_FRAMES,
-        "USE_RIGHT_LANE_YELLOW_LOCK": USE_RIGHT_LANE_YELLOW_LOCK,
-        "RIGHT_LANE_FROM_YELLOW": RIGHT_LANE_FROM_YELLOW,
-        "YELLOW_LANE_SIDE": YELLOW_LANE_SIDE,
-        "YELLOW_LANE_SEARCH_MARGIN_PX": YELLOW_LANE_SEARCH_MARGIN_PX,
-        "YELLOW_MIN_PIXELS_PER_SCANLINE": YELLOW_MIN_PIXELS_PER_SCANLINE,
-        "YELLOW_RIGHT_LANE_HOLD_FRAMES": YELLOW_RIGHT_LANE_HOLD_FRAMES,
-        "USE_NO_YELLOW_WIDE_BLOB_GATE": USE_NO_YELLOW_WIDE_BLOB_GATE,
-        "NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO": NO_YELLOW_MAX_BLOB_WIDTH_PX_RATIO,
-        "NO_YELLOW_MAX_MEASURED_WIDTH_MM": NO_YELLOW_MAX_MEASURED_WIDTH_MM,
-        "ALLOW_NO_YELLOW_BLOB_SPLIT": ALLOW_NO_YELLOW_BLOB_SPLIT,
-        "CAMERA_CENTER_X_RATIO": CAMERA_CENTER_X_RATIO,
-        "CAMERA_CENTER_OFFSET_PX": CAMERA_CENTER_OFFSET_PX,
-        "CAMERA_CENTER_OFFSET_MM": CAMERA_CENTER_OFFSET_MM,
-        "MIN_CLEARANCE_MM": MIN_CLEARANCE_MM,
-        "MAX_REASONABLE_CORRIDOR_ERROR_MM": MAX_REASONABLE_CORRIDOR_ERROR_MM,
-        "MAX_REASONABLE_CLEARANCE_MM": MAX_REASONABLE_CLEARANCE_MM,
-        "MAX_STEERING_SATURATION_FRAMES": MAX_STEERING_SATURATION_FRAMES,
-        "CENTERLINE_SMOOTHING_ALPHA": CENTERLINE_SMOOTHING_ALPHA,
-        "CURVE_DEADBAND_PX": CURVE_DEADBAND_PX,
-        "CURVE_STRONG_PX": CURVE_STRONG_PX,
-        "CENTER_DEADBAND_PX": CENTER_DEADBAND_PX,
-        "CENTER_STRONG_PX": CENTER_STRONG_PX,
-        "SCANLINE_COUNT": SCANLINE_COUNT,
-    }
+    config = {"config_source": config_source}
+    config.update({key: value for key, value in settings.items() if is_json_scalar(value)})
     return config
 
 
@@ -1990,7 +1930,31 @@ def safe_number(value, default=""):
     return value
 
 
-def build_telemetry_row(frame_index, time_sec, result, confidences, selected_path, turn_hint, processing_fps):
+def is_json_scalar(value):
+    return isinstance(value, (str, int, float, bool)) or value is None
+
+
+def build_helper_output(result, turn_hint, camera_type, timestamp=None):
+    """Return the future ROS2 payload as a plain JSON-serializable dict."""
+    return {
+        "timestamp": timestamp,
+        "road_detected": bool(result.road_detected),
+        "road_confidence": float(result.road_confidence),
+        "safe_corridor_valid": bool(result.safe_corridor_valid),
+        "visual_helper_active": bool(result.visual_helper_active),
+        "visual_steering_correction": float(result.visual_steering_correction),
+        "corridor_center_error_mm": result.corridor_center_error_mm,
+        "left_clearance_mm": result.left_clearance_mm,
+        "right_clearance_mm": result.right_clearance_mm,
+        "turn_hint": turn_hint,
+        "safe_corridor_reason": result.safe_corridor_reason,
+        "yellow_boundary_detected": bool(result.yellow_boundary_detected),
+        "right_lane_lock_active": bool(result.right_lane_lock_active),
+        "camera_type": camera_type,
+    }
+
+
+def build_telemetry_row(frame_index, time_sec, result, turn_hint, processing_fps, camera_type="unknown"):
     height, width = result.mask.shape[:2]
     mask_area_pixels = int(cv2.countNonZero(result.mask))
     mask_area_percent = mask_area_pixels / max(1, width * height) * 100.0
@@ -2059,10 +2023,7 @@ def build_telemetry_row(frame_index, time_sec, result, confidences, selected_pat
         "right_space_mm": safe_number(result.right_space_mm),
         "unphysical_corridor_geometry": result.unphysical_corridor_geometry,
         "steering_saturation_count": result.steering_saturation_count,
-        "selected_path": selected_path,
-        "straight_confidence": f"{confidences['straight']:.4f}",
-        "left_confidence": f"{confidences['left']:.4f}",
-        "right_confidence": f"{confidences['right']:.4f}",
+        "helper_output_json": json.dumps(build_helper_output(result, turn_hint, camera_type, time_sec), sort_keys=True),
         "mask_area_pixels": mask_area_pixels,
         "mask_area_percent": f"{mask_area_percent:.4f}",
         "centerline_point_count": len(result.scan_points),
@@ -2090,14 +2051,13 @@ def write_event_row(writer, frame_index, time_sec, event_type, old_value, new_va
     )
 
 
-def detect_frame_events(frame_index, time_sec, result, selected_path, turn_hint, previous_state):
+def detect_frame_events(frame_index, time_sec, result, turn_hint, previous_state):
     events = []
     current_state = {
         "road_detected": result.road_detected,
         "road_center_error_px": result.road_center_error_px,
         "curve_error_px": result.curve_error_px,
         "turn_hint": turn_hint,
-        "selected_path": selected_path,
         "tracked_center_valid": result.tracked_center_valid,
         "low_confidence": result.road_confidence < 0.60,
         "rejected_scanlines_high": result.rejected_scanlines >= 5,
@@ -2153,8 +2113,6 @@ def detect_frame_events(frame_index, time_sec, result, selected_path, turn_hint,
 
     if previous_state["turn_hint"] != turn_hint:
         events.append(("turn_hint_changed", previous_state["turn_hint"], turn_hint, "Curve direction hint changed."))
-    if previous_state["selected_path"] != selected_path:
-        events.append(("selected_path_changed", previous_state["selected_path"], selected_path, "Selected candidate path changed."))
     return events, current_state
 
 
@@ -2345,7 +2303,6 @@ def write_ai_summary_json(path, args, processed_frames, total_frames, duration_s
         "curve_jump_count": stats["curve_jump_count"],
         "tracked_center_invalid_count": stats["tracked_center_invalid_count"],
         "turn_hint_counts": stats["turn_hint_counts"],
-        "selected_path_counts": stats["selected_path_counts"],
         "safe_corridor_valid_percent": stats["safe_corridor_valid_percent"],
         "visual_helper_active_percent": stats["visual_helper_active_percent"],
         "average_measured_lane_width_mm": stats["average_measured_lane_width_mm"],
@@ -2391,7 +2348,7 @@ def write_run_notes(path, args, folders):
         "Main output files:",
         "- human_output annotated MP4: watch this for visual inspection.",
         "- telemetry CSV: one row per processed frame with numeric detector state.",
-        "- events CSV: only important changes such as road loss, low confidence, jumps, and path changes.",
+        "- events CSV: only important changes such as road loss, low confidence, jumps, and helper state changes.",
         "- summary AI JSON: structured run summary and grouped problem intervals.",
         "- config used JSON: exact HSV/ROI/math thresholds used for the run.",
         "- frame_samples: periodic original/raw_mask/ego_mask/overlay/debug/safe_corridor_debug images.",
@@ -2401,7 +2358,7 @@ def write_run_notes(path, args, folders):
         "- No machine learning, no training, no YOLO, no PyTorch, no TensorFlow.",
         "- RGB only; no ROS2 and no RealSense depth processing yet.",
         "- Lighting changes and road color changes may require HSV retuning.",
-        "- Candidate paths are secondary debug hints; the blue safe corridor is the main local visual helper.",
+        "- The blue safe corridor is a drift helper only; it is not a path planner.",
         "",
         "Files to upload to ChatGPT for analysis:",
         "- test_video_telemetry.csv",
@@ -2423,7 +2380,6 @@ def collect_stats(rows, event_counts, processed_frames):
     low_confidence_frame_count = sum(1 for row in rows if float(row["road_confidence"]) < 0.60)
     rejected_scanline_problem_count = sum(1 for row in rows if int(row["rejected_scanlines"]) >= 5)
     turn_hint_counts = Counter(row["turn_hint"] for row in rows)
-    selected_path_counts = Counter(row["selected_path"] for row in rows)
     safe_valid_count = sum(1 for row in rows if row["safe_corridor_valid"] is True)
     helper_active_count = sum(1 for row in rows if row["visual_helper_active"] is True)
     lane_widths_mm = numeric_values(rows, "measured_lane_width_mm")
@@ -2475,7 +2431,6 @@ def collect_stats(rows, event_counts, processed_frames):
         "curve_jump_count": event_counts["curve_jump"],
         "tracked_center_invalid_count": sum(1 for row in rows if row["tracked_center_valid"] is False),
         "turn_hint_counts": dict(turn_hint_counts),
-        "selected_path_counts": dict(selected_path_counts),
         "most_common_turn_hint": most_common_text([row["turn_hint"] for row in rows]),
         "safe_corridor_valid_percent": safe_valid_count / max(1, processed_frames) * 100.0,
         "visual_helper_active_percent": helper_active_count / max(1, processed_frames) * 100.0,
@@ -2510,9 +2465,9 @@ def collect_stats(rows, event_counts, processed_frames):
 
 
 def process_video_tuning_mode(args):
-    # Manual video tuning is a human-in-the-loop step before auto-tuning. The
+    # Manual video tuning is the human-in-the-loop camera setup step. The
     # user pauses on hard frames, adjusts simple RGB/OpenCV/NumPy mask values,
-    # and saves a good baseline instead of letting an optimizer start randomly.
+    # and saves a camera config for later video analysis or ROS2 porting.
     if not args.video:
         raise RuntimeError("--video is required when using --tune-video")
     video_path = Path(args.video)
@@ -2532,7 +2487,7 @@ def process_video_tuning_mode(args):
         source_fps = 30.0
 
     folders = create_manual_tuning_folders()
-    config_output_path = Path(args.config_output)
+    config_output_path = Path(args.config_output or args.config)
     session_output_path = Path(args.session_output)
     session = {
         "good_sample_frames": [],
@@ -2554,18 +2509,17 @@ def process_video_tuning_mode(args):
     playback_speed = max(0.1, float(args.playback_speed))
     paused = False
     show_mask_window = False
-    show_candidates = False
     use_ego_connected_mask = USE_EGO_CONNECTED_MASK
     use_yellow_boundary_lock = USE_YELLOW_BOUNDARY_LOCK
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
     lane_side_memory = {}
     safe_corridor_state = {}
-    tracker = PathConfidenceTracker()
+    drift_state = {}
 
     print("Manual video tuning controls:")
     print("q/ESC quit | p/SPACE pause | s save config | l load config-output | r reset")
-    print("e toggle ego-connected mask | y toggle yellow-boundary lock | m mask window | c secondary candidate paths")
+    print("e toggle ego-connected mask | y toggle yellow-boundary lock | m mask window")
     print("g good sample | f difficult sample | d debug snapshot | n/right next | b/left back")
 
     try:
@@ -2582,7 +2536,7 @@ def process_video_tuning_mode(args):
                 break
 
             frame = resize_frame(frame)
-            settings = get_trackbar_settings()
+            settings = get_trackbar_settings(settings)
             result = detect_road(
                 frame,
                 settings,
@@ -2600,20 +2554,9 @@ def process_video_tuning_mode(args):
             else:
                 frames_since_valid += 1
 
-            confidences, selected_path, smoothed_curve_error_px, turn_hint = tracker.update(
-                result.road_center_error_px,
-                result.curve_error_px,
-                result.road_detected,
-            )
-            debug_frame = draw_visualization(
-                frame,
-                result,
-                confidences,
-                selected_path,
-                smoothed_curve_error_px,
-                turn_hint,
-                show_candidates,
-            )
+            turn_hint = compute_turn_hint(result.curve_error_px, settings)
+            apply_drift_only_gate(result, turn_hint, drift_state, settings)
+            debug_frame = draw_visualization(frame, result, turn_hint)
             overlay = build_road_overlay(frame, result)
             display = build_display_grid(frame, result, debug_frame)
             cv2.putText(
@@ -2681,8 +2624,6 @@ def process_video_tuning_mode(args):
                 last_center_x = None
                 frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
                 print(f"Yellow-boundary lock {'on' if use_yellow_boundary_lock else 'off'}.")
-            elif key == ord("c"):
-                show_candidates = not show_candidates
             elif key in (ord("n"), 83, 2555904):
                 paused = True
                 current_frame_index = seek_video_frame(cap, current_frame_index + 1, total_frames)
@@ -2828,10 +2769,7 @@ def process_video_source(args):
         "right_space_mm",
         "unphysical_corridor_geometry",
         "steering_saturation_count",
-        "selected_path",
-        "straight_confidence",
-        "left_confidence",
-        "right_confidence",
+        "helper_output_json",
         "mask_area_pixels",
         "mask_area_percent",
         "centerline_point_count",
@@ -2843,15 +2781,14 @@ def process_video_source(args):
         create_trackbars(settings)
         cv2.namedWindow(WINDOW_MAIN, cv2.WINDOW_NORMAL)
 
-    tracker = PathConfidenceTracker()
     show_mask_window = False
-    show_candidates = False
     paused = False
     stopped_early = False
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
     lane_side_memory = {}
     safe_corridor_state = {}
+    drift_state = {}
     frame_index = 0
     processed_frames = 0
     failure_saved_count = 0
@@ -2896,7 +2833,7 @@ def process_video_source(args):
 
                 frame = resize_frame(frame)
                 if not args.no_display:
-                    settings = get_trackbar_settings()
+                    settings = get_trackbar_settings(settings)
 
                 time_sec = frame_index / source_fps
                 elapsed = max(0.001, time.perf_counter() - run_start_time)
@@ -2918,20 +2855,9 @@ def process_video_source(args):
                 else:
                     frames_since_valid += 1
 
-                confidences, selected_path, smoothed_curve_error_px, turn_hint = tracker.update(
-                    result.road_center_error_px,
-                    result.curve_error_px,
-                    result.road_detected,
-                )
-                debug_frame = draw_visualization(
-                    frame,
-                    result,
-                    confidences,
-                    selected_path,
-                    smoothed_curve_error_px,
-                    turn_hint,
-                    show_candidates,
-                )
+                turn_hint = compute_turn_hint(result.curve_error_px, settings)
+                apply_drift_only_gate(result, turn_hint, drift_state, settings)
+                debug_frame = draw_visualization(frame, result, turn_hint)
                 overlay = build_road_overlay(frame, result)
                 writer.write(debug_frame)
                 last_debug_frame = debug_frame.copy()
@@ -2940,10 +2866,9 @@ def process_video_source(args):
                     frame_index,
                     time_sec,
                     result,
-                    confidences,
-                    selected_path,
                     turn_hint,
                     processing_fps,
+                    camera_type=str(settings.get("camera_type", "unknown")),
                 )
                 write_telemetry_row(telemetry_writer, telemetry_row)
                 rows.append(telemetry_row)
@@ -2952,7 +2877,6 @@ def process_video_source(args):
                     frame_index,
                     time_sec,
                     result,
-                    selected_path,
                     turn_hint,
                     previous_state,
                 )
@@ -3028,9 +2952,6 @@ def process_video_source(args):
                     elif action == "toggle_pause":
                         paused = True
                         print("Paused.")
-                    elif action == "toggle_candidates":
-                        show_candidates = not show_candidates
-                        print("Secondary candidate paths on." if show_candidates else "Secondary candidate paths off.")
 
                 frame_index += 1
         finally:
@@ -3079,11 +3000,6 @@ def main():
 
     if args.source == "video":
         try:
-            if args.auto_tune:
-                from auto_tuner import run_auto_tune
-
-                run_auto_tune(args)
-                return 0
             if args.tune_video:
                 return process_video_tuning_mode(args)
             return process_video_source(args)
@@ -3097,18 +3013,18 @@ def main():
         print(f"ERROR: {exc}")
         return 1
 
-    create_trackbars(DEFAULT_SETTINGS)
+    settings, _config_source = load_video_settings(args)
+    create_trackbars(settings)
     cv2.namedWindow(WINDOW_MAIN, cv2.WINDOW_NORMAL)
 
-    tracker = PathConfidenceTracker()
     show_mask_window = False
-    show_candidates = False
     paused = False
     last_frame = None
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
     lane_side_memory = {}
     safe_corridor_state = {}
+    drift_state = {}
 
     try:
         while True:
@@ -3120,7 +3036,7 @@ def main():
                 last_frame = resize_frame(frame)
 
             frame = last_frame.copy()
-            settings = get_trackbar_settings()
+            settings = get_trackbar_settings(settings)
             result = detect_road(
                 frame,
                 settings,
@@ -3136,20 +3052,9 @@ def main():
             else:
                 frames_since_valid += 1
 
-            confidences, selected_path, smoothed_curve_error_px, turn_hint = tracker.update(
-                result.road_center_error_px,
-                result.curve_error_px,
-                result.road_detected,
-            )
-            visualization = draw_visualization(
-                frame,
-                result,
-                confidences,
-                selected_path,
-                smoothed_curve_error_px,
-                turn_hint,
-                show_candidates,
-            )
+            turn_hint = compute_turn_hint(result.curve_error_px, settings)
+            apply_drift_only_gate(result, turn_hint, drift_state, settings)
+            visualization = draw_visualization(frame, result, turn_hint)
             display = build_display_grid(frame, result, visualization)
             cv2.imshow(WINDOW_MAIN, display)
 
@@ -3170,9 +3075,6 @@ def main():
             elif action == "toggle_pause":
                 paused = not paused
                 print("Paused." if paused else "Unpaused.")
-            elif action == "toggle_candidates":
-                show_candidates = not show_candidates
-                print("Secondary candidate paths on." if show_candidates else "Secondary candidate paths off.")
     finally:
         source.release()
         cv2.destroyAllWindows()

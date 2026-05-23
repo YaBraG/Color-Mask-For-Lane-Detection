@@ -4,6 +4,45 @@
 
 Files changed:
 
+- `main.py`
+- `configs/csi_front_config.json`
+- `configs/realsense_config.json`
+- `README.md`
+- `CHANGELOG.md`
+- Removed `config.py`
+- Removed `auto_tuner.py`
+- Removed `scoring.py`
+
+Summary:
+
+- Cleaned the repository for the final pre-ROS2 RGB drift-helper workflow.
+- Consolidated the active detector runtime into `main.py` so the runnable detector no longer imports `config.py`, `auto_tuner.py`, or `scoring.py`.
+- Added final camera-specific JSON configs: `configs/csi_front_config.json` and `configs/realsense_config.json`.
+- Removed the old auto-tune/trainer CLI and modules from the active workflow. Auto-tuning was useful during development; its learned values are preserved in the final config JSON files.
+- Removed old candidate-arrow/path-confidence behavior from the primary runtime. The main helper output is now the blue safe corridor, `corridor_center_error_mm`, `visual_steering_correction`, `visual_helper_active`, and `safe_corridor_reason`.
+- Added drift-only helper gating so the correction disables during turns, high curve error, unstable corridors, ambiguous/wide blobs, unphysical geometry, and repeated steering saturation.
+- Added `build_helper_output(...)`, a ROS2-ready dictionary payload for the future node/topic.
+- Rewrote README.md around the final QCar2 RGB drift-helper purpose and Python 3.13 commands.
+
+Removed/de-emphasized prototype features:
+
+- Removed active auto-tuning/trainer code from the final runtime path.
+- Removed candidate path selection as a steering concept.
+- Removed dependency on `road_config.json` and `config.py` for the final workflow.
+
+Known limitations:
+
+- Still RGB-only and row-local; there is no camera calibration, homography, depth, ROS2 publishing, or route-level permission to cross yellow boundaries yet.
+- The helper is intentionally conservative and may disable often when visual geometry is ambiguous.
+
+Follow-up work:
+
+- Port `build_helper_output(...)` into a ROS2 node/topic and keep the normal QCar2 controller in charge.
+
+## 2026-05-23
+
+Files changed:
+
 - `config.py`
 - `main.py`
 - `auto_tuner.py`

@@ -1,346 +1,152 @@
-# QCar2 RGB Road Detector Prototype
+# QCar2 RGB Drift Helper
 
-This project is a simple RGB-only road/drivable-area detector for a QCar2-style lane/path helper using an Intel RealSense D435 color stream, a regular webcam, or a static test image.
+This repository contains a final-prep RGB/OpenCV/NumPy detector for QCar2 lane-drift assistance. It is not a full autonomous planner. The normal QCar2 controller/path follower remains in charge.
 
-It uses classical OpenCV and NumPy only. There is no ROS2, no depth processing, no machine learning, no training, and no neural network dependency.
+The camera helper only tries to answer one local question: is the car drifting left or right inside a believable, straight-ish drivable corridor? When the visual geometry is turning, wide, ambiguous, physically impossible, or missing important cues, the helper turns off and outputs `visual_steering_correction = 0`.
 
-## Why Road Detection Instead Of Lane Lines
-
-The indoor road map has a dark gray/black drivable surface, while sidewalks, buildings, and background areas are light gray/white. Yellow lane markings are useful visual cues, but they stop at intersections and forks.
-
-For that reason this prototype detects the road surface itself, treats non-road as unsafe, estimates the drivable corridor, and draws a suggested center path. At forks or intersections, it shows simple demo path candidates for left, straight, and right, then highlights the candidate that best matches the current road-center trend.
+There is no machine learning, no reinforcement learning, no PyTorch, no TensorFlow, no YOLO, no ROS2, and no depth processing.
 
 ## Install
 
-Use Python 3.13 on Windows. A virtual environment is not required.
+Use Python 3.13 on Windows:
 
 ```powershell
 py -3.13 -m pip install --upgrade pip
 py -3.13 -m pip install -r requirements.txt
 ```
 
-`pyrealsense2` is listed in `requirements.txt` for RealSense support. If it is not installed, image and webcam modes still work.
+`pyrealsense2` is optional at runtime. If it is unavailable, image, video, and webcam modes still work.
 
-## Run
+## Final Runtime Files
 
-Static image tuning mode:
+The active detector runtime is intentionally simple:
 
-```powershell
-py -3.13 main.py --source image --image test.jpg
-```
+- `main.py`: detector, visualization, tuning, video analysis, and ROS2-ready helper-output dictionary
+- `configs/csi_front_config.json`: CSI/front camera config for `assets/test_video_2.mp4`
+- `configs/realsense_config.json`: RealSense D435 RGB config for `assets/test_video.mp4`
 
-Webcam mode:
+Generated `outputs/` and local videos under `assets/*.mp4` are ignored by git.
 
-```powershell
-py -3.13 main.py --source webcam --camera-index 0
-```
+## Run Commands
 
-RealSense D435 RGB-only mode:
+CSI/front video analysis:
 
 ```powershell
-py -3.13 main.py --source realsense
+py -3.13 main.py --source video --video assets/test_video_2.mp4 --config configs/csi_front_config.json --no-display --output-dir outputs --save-failure-frames
 ```
 
-## Video Processing Mode
-
-Offline video processing runs a local video through the same RGB road-mask, centerline, curve, confidence, and candidate-path logic used by the live modes. This is useful for repeatable testing because the same frames can be processed again after tuning changes.
-
-Run the local test video:
+CSI/front manual tuning:
 
 ```powershell
-py -3.13 main.py --source video --video assets/test_video.mp4
+py -3.13 main.py --source video --video assets/test_video_2.mp4 --tune-video --config configs/csi_front_config.json
 ```
 
-Run without opening OpenCV display windows:
+RealSense RGB video analysis:
 
 ```powershell
-py -3.13 main.py --source video --video assets/test_video.mp4 --no-display
+py -3.13 main.py --source video --video assets/test_video.mp4 --config configs/realsense_config.json --no-display --output-dir outputs --save-failure-frames
 ```
 
-Run with the built-in defaults from `config.py`, ignoring any saved tuning:
+Live RealSense RGB:
 
 ```powershell
-py -3.13 main.py --source video --video assets/test_video.mp4 --use-default-config --no-display
+py -3.13 main.py --source realsense --config configs/realsense_config.json
 ```
 
-Load a specific saved tuning file:
+Webcam/CSI capture testing:
 
 ```powershell
-py -3.13 main.py --source video --video assets/test_video.mp4 --config path\to\road_config.json --no-display
+py -3.13 main.py --source webcam --camera-index 0 --config configs/csi_front_config.json
 ```
 
-Choose the output folder:
+## Manual Tuning
 
-```powershell
-py -3.13 main.py --source video --video assets/test_video.mp4 --output-dir outputs
-```
+Manual tuning is kept because lighting and camera mounting can change. It opens the video, shows the 2x2 debug view, and exposes HSV/mask trackbars.
 
-By default, video mode loads `road_config.json` when that file exists. This lets a saved live tuning carry into offline analysis, but it also means `road_config.json` overrides the defaults in `config.py` unless `--use-default-config` is passed. The file `test_video_config_used.json` records the exact values and `config_source` used for each run.
+Useful keys:
 
-Video mode writes each run into a timestamped folder so old samples, telemetry, and failure frames do not mix with new results:
+- `p` or `SPACE`: pause/unpause
+- `n`: next frame while paused
+- `b`: previous frame
+- `s`: save current config
+- `d`: save a debug snapshot
+- `y`: toggle yellow-boundary/right-lane enforcement
+- `e`: toggle ego-connected road mask
+- `q` or `ESC`: quit
 
-```text
-outputs/
-  test_video_YYYYMMDD_HHMMSS/
-    human_output/
-    output_for_AI/
-  latest_run.txt
-```
+When `--config-output` is omitted, pressing `s` saves back to the file passed with `--config`.
 
-`outputs/latest_run.txt` points to the most recent run folder. `output_for_AI` lives inside the per-run folder so uploaded AI analysis files all come from the same video pass. Previous runs are kept automatically. Use `--clean-output` only to delete the newly selected timestamped run folder before writing if that exact folder already exists.
+## Blue Safe Corridor
 
-Each timestamped run creates two output folders:
+The road mask can be wider than the usable lane. The blue hallway is the constrained safe corridor, not the whole road blob.
 
-- `human_output` is for watching and visually checking the result. It contains the annotated MP4, a short human-readable summary, and representative key frames.
-- `output_for_AI` is for uploading to ChatGPT for deeper analysis. It contains structured CSV/JSON files, run notes, periodic frame samples, and optional failure frames.
-
-Files to upload to ChatGPT for analysis:
-
-- `test_video_telemetry.csv`
-- `test_video_events.csv`
-- `test_video_summary_ai.json`
-- `test_video_config_used.json`
-- selected `failure_frames`
-- selected `frame_samples`
-
-The annotated video is best for human visual inspection. The CSV, JSON, frame samples, and failure frames are better for AI debugging because they preserve the detector's numeric state and selected visual evidence. The local file `assets/test_video.mp4` is intentionally not committed and is ignored by git because it is large.
-
-## Ego-Connected Road Mask
-
-HSV thresholding detects every road-colored pixel in the frame. That can include parking lots, side roads, or disconnected dark areas that look like the road but are not the road directly in front of the QCar2.
-
-The ego-connected mask keeps only the white road component connected to the bottom-center/front area of the image. The seed point is near the lower center of the frame, and if that exact pixel is black, the detector searches nearby for the closest white road pixel, preferring pixels in the bottom band because they are closer to the car.
-
-This filtered mask is what centerline tracking uses, so disconnected side-road blobs should not affect scanline centers, `road_center_error_px`, `curve_error_px`, `turn_hint`, or path confidences. Video samples now include both `frame_XXXXXX_raw_mask.jpg` and `frame_XXXXXX_ego_mask.jpg` so the raw HSV result can be compared with the driving/path-extraction mask.
-
-If a side area is physically connected to the main road, ego filtering alone may still include it. The scanline tracker still enforces centerline continuity with `MAX_CENTER_JUMP_PX` after the first anchor, but future map/path guidance may be needed for complex connected branches.
-
-## Safe Space Drivable Area
-
-The road mask can be wider than the lane the QCar2 should actually use. Intersections, parking-lot-like areas, and side branches may all be valid road-colored pixels, but they are not necessarily a safe local corridor.
-
-The blue hallway is the safe space drivable area. It is based on the ego-connected road mask, nearby lower scanline road edges, and known physical dimensions:
+Physical values are in millimeters:
 
 - `LANE_WIDTH_MM = 254.0`
 - `CAR_WIDTH_MM = 203.2`
 - `SAFE_HALLWAY_WIDTH_MM = 227.2`
 
-The safe hallway width is the car width plus a `12 mm` sidewalk margin and a `12 mm` line margin. The detector estimates local left/right road edges, converts nearby pixel widths to millimeters using the known lane width, and computes:
+The helper estimates nearby left/right road edges from lower scanlines, converts row-local pixels to millimeters using the known lane width, and computes:
 
-- left/right clearance in mm
-- corridor center error in mm
+- `corridor_center_error_mm`
+- `left_clearance_mm`
+- `right_clearance_mm`
 - `visual_steering_correction`
-- whether the visual helper is active
 
-The helper only activates when the local corridor appears physically valid. If the measured lane is too narrow, too wide, low-confidence, missing ego connection, or has too few usable lower scanlines, `safe_corridor_valid = False`, `visual_helper_active = False`, and `visual_steering_correction = 0`. In those wide or ambiguous areas, the normal controller is expected to remain in charge.
+If clearances are negative, the lane is too wide/narrow, the center error is too large, steering saturates too long, or the corridor is not straight-ish, the helper disables itself.
 
-The steering helper uses the selected lane segment center relative to the camera/car reference point. By default the reference is image center, but `CAMERA_CENTER_X_RATIO`, `CAMERA_CENTER_OFFSET_PX`, and `CAMERA_CENTER_OFFSET_MM` can be tuned later if the CSI camera is physically offset.
+## Yellow Right-Lane Lock
 
-The geometry must stay physically believable. Since the lane is `254 mm` and the car is `203.2 mm`, centered clearance is only about `25.4 mm` per side. Negative clearances, huge corridor-center errors, or excessive clearance values make the helper turn off with `safe_corridor_reason = "unphysical_corridor_geometry"`. If steering stays saturated for too many consecutive frames, the helper also turns off with `safe_corridor_reason = "steering_saturated_too_long"`.
+The yellow line is treated as a hard lane divider. When yellow is visible, the helper builds the blue corridor only from the road segment to the right of the yellow boundary. It does not cross the yellow line unless future route logic explicitly allows that.
 
-The older candidate arrows are now secondary debug hints. The primary local steering helper output is the blue safe corridor plus `corridor_center_error_mm` and `visual_steering_correction`.
+If yellow is missing and the ego road blob is too wide, the helper turns off with `safe_corridor_reason = "wide_blob_no_yellow"` instead of guessing.
 
-## Yellow Boundary Lock
+## Drift-Only Gating
 
-The road mask can include both lanes when both sides of the yellow line have road-colored pixels. The yellow lane line is detected as a separate boundary mask and removed from the road mask, so yellow paint is never treated as drivable road.
+The helper is intentionally conservative. It disables correction when:
 
-When `USE_YELLOW_BOUNDARY_LOCK = True`, the yellow line acts as a no-cross divider for the blue safe hallway. The detector keeps the lane-side region connected to the ego/front-bottom road area and uses short lane-side memory to avoid flickering between sides. If the blue corridor crosses or overlaps the yellow boundary, the helper disables itself:
+- `turn_hint` is `left` or `right`
+- `abs(curve_error_px)` is above `DRIFT_MAX_ABS_CURVE_ERROR_PX`
+- the safe corridor is invalid
+- yellow/right-lane geometry is invalid
+- no-yellow wide-blob gate is active
+- physical geometry is impossible
+- steering correction saturates too long
 
-- `safe_corridor_valid = False`
-- `visual_helper_active = False`
-- `safe_corridor_reason = "crosses_yellow_boundary"`
-- `visual_steering_correction = 0`
+When disabled, `visual_helper_active = False` and `visual_steering_correction = 0`.
 
-Manual video tuning has a debug toggle: press `y` to turn yellow-boundary enforcement on or off for comparison. Frame samples include `yellow_boundary_mask` so the road mask, ego mask, and yellow divider can be inspected separately.
+## Outputs
 
-## Right-Lane Yellow Lock
-
-For the current front CSI camera workflow, the desired lane is the right side of the yellow divider. When yellow is visible, the safe corridor does not pick the largest black blob or the blob nearest image center. Instead, each lower safe-corridor scanline finds the right edge of the yellow mask, adds a small search margin, and uses the road segment immediately to the right of that boundary.
-
-This keeps the blue hallway on the car's current right-lane side:
-
-- yellow line = lane divider
-- right side of yellow = allowed lane
-- left side of yellow = ignored for the safe corridor
-
-If no right-lane segment is found while yellow is visible, the helper disables itself instead of guessing. If yellow is not visible and the ego road blob is too wide, the helper also disables itself with `safe_corridor_reason = "wide_blob_no_yellow"`. This prevents open black road areas, intersections, or parking-lot-like blobs from pulling the blue hallway into an ambiguous path.
-
-## Manual Video Tuning Mode
-
-Manual video tuning plays a recorded QCar2 ride with the same 2x2 display used by the detector: original RGB, road mask, road overlay, and detected center path/debug view. It is for finding a good RGB/OpenCV/NumPy baseline config before building the future auto-tuning optimizer.
-
-Run manual tuning:
-
-```powershell
-py -3.13 main.py --source video --video assets/test_video.mp4 --tune-video
-```
-
-Save the current tuning values by pressing `s`. By default, the config is saved to:
+Each video run creates:
 
 ```text
-configs/manual_tuned_config.json
+outputs/<video_name_YYYYMMDD_HHMMSS>/
+  human_output/
+  output_for_AI/
 ```
 
-You can choose a different output path:
+`human_output` contains the annotated video and readable summary. `output_for_AI` contains telemetry CSV, events CSV, config used JSON, summary AI JSON, frame samples, and failure frames.
 
-```powershell
-py -3.13 main.py --source video --video assets/test_video.mp4 --tune-video --config-output configs/manual_tuned_config.json
+Telemetry includes a `helper_output_json` field. That dictionary is the future ROS2 message payload shape:
+
+```json
+{
+  "road_detected": true,
+  "road_confidence": 0.9,
+  "safe_corridor_valid": true,
+  "visual_helper_active": true,
+  "visual_steering_correction": 0.03,
+  "corridor_center_error_mm": 3.0,
+  "left_clearance_mm": 24.0,
+  "right_clearance_mm": 27.0,
+  "turn_hint": "straight",
+  "safe_corridor_reason": "valid",
+  "yellow_boundary_detected": true,
+  "right_lane_lock_active": true,
+  "camera_type": "csi_front"
+}
 ```
 
-Manual tuning starts from `DEFAULT_SETTINGS` unless `--config` is explicitly provided. To start from an existing saved config:
+## Future ROS2 Port
 
-```powershell
-py -3.13 main.py --source video --video assets/test_video.mp4 --tune-video --config configs/manual_tuned_config.json
-```
-
-Useful keys:
-
-- `p` or `SPACE`: pause/unpause
-- `s`: save `configs/manual_tuned_config.json`
-- `l`: load from `--config-output`
-- `r`: reset to `DEFAULT_SETTINGS`
-- `e`: toggle ego-connected mask filtering for comparison
-- `n` or right arrow: step forward while paused
-- `b` or left arrow: step backward
-- `g`: save a good tuning sample
-- `f`: save a difficult tuning sample
-- `d`: save a full debug snapshot
-- `[` and `]`: decrease/increase playback speed
-- `q` or `ESC`: quit
-
-Samples are saved here:
-
-```text
-outputs/manual_tuning/
-  good_samples/
-  difficult_samples/
-  debug_snapshots/
-```
-
-`g` and `f` save original, mask, and debug images. `d` saves original, mask, overlay, and debug images. The session file `configs/manual_tuning_session.json` records saved sample frame numbers and notes for future auto-tuning.
-
-This mode does not train anything, does not use machine learning, and does not control the QCar2. The future optimizer should use `configs/manual_tuned_config.json` as its starting point instead of searching randomly.
-
-## Auto-Tuning Workflow
-
-Auto-tuning is offline hyperparameter optimization for the OpenCV/NumPy detector. It does not train a model, does not use reinforcement learning, and does not control the QCar2. It tests many detector configurations around a seed config, scores each one on sampled video frames, fully evaluates the best few, then writes a final `best_config.json`.
-
-Recommended workflow:
-
-1. Run manual tuning:
-
-```powershell
-py -3.13 main.py --source video --video assets/test_video.mp4 --tune-video
-```
-
-2. Pause on difficult frames, adjust the trackbars, and press `s` to save `configs/manual_tuned_config.json`.
-
-3. Run auto-tuning from that seed:
-
-```powershell
-py -3.13 main.py --source video --video assets/test_video.mp4 --auto-tune --seed-config configs/manual_tuned_config.json --output-dir outputs --max-configs 500 --top-k 10 --full-eval-top-k 5
-```
-
-For a faster smoke test:
-
-```powershell
-py -3.13 main.py --source video --video assets/test_video.mp4 --auto-tune --seed-config configs/manual_tuned_config.json --quick --output-dir outputs
-```
-
-4. Use the winning config for a final analysis pass:
-
-```powershell
-py -3.13 main.py --source video --video assets/test_video.mp4 --config outputs/auto_tune_test_video_YYYYMMDD_HHMMSS/output_for_AI/best_config.json --no-display --output-dir outputs --save-failure-frames
-```
-
-Auto-tuning creates a timestamped folder:
-
-```text
-outputs/
-  auto_tune_test_video_YYYYMMDD_HHMMSS/
-    human_output/
-      best_config_annotated.mp4
-      auto_tune_summary.txt
-      best_config_summary.txt
-      comparison_frames/
-    output_for_AI/
-      auto_tune_scores.csv
-      top_configs.json
-      best_config.json
-      best_config_metrics.json
-      auto_tune_summary_ai.json
-      search_space.json
-      seed_config_used.json
-      best_run_telemetry.csv
-      best_run_events.csv
-      frame_samples/
-      failure_frames/
-```
-
-`best_config.json` contains metadata, the final score, and the winning detector config. `human_output` is for watching and skimming. `output_for_AI` is for detailed analysis, CSV review, and future tuning discussions. `outputs/latest_auto_tune_run.txt` points to the most recent auto-tune run.
-
-## Controls
-
-- `q` or `ESC`: quit
-- `s`: save current HSV and ROI settings to `road_config.json`
-- `l`: load settings from `road_config.json`
-- `r`: reset HSV settings to defaults
-- `m`: toggle separate mask debug window
-- `p`: pause/unpause frame processing
-- `c`: toggle demo candidate paths on/off
-
-## Tuning
-
-1. Put the camera in the QCar2 point of view.
-2. Run image, webcam, or RealSense mode.
-3. Adjust the HSV trackbars until the road is white in the mask and the sidewalk/background is black.
-4. Adjust `ROI_top_percent` if the upper image contains distracting walls, signs, windows, or traffic lights.
-5. Adjust `Morph_kernel` to remove noise.
-6. Adjust `Close_kernel` to fill small black holes inside the road mask. `Close_kernel = 0` disables close morphology.
-7. Press `s` to save settings.
-
-Default dark-road settings from live QCar2 RealSense camera testing:
-
-- `H_min = 0`
-- `H_max = 179`
-- `S_min = 0`
-- `S_max = 80`
-- `V_min = 20`
-- `V_max = 120`
-- `ROI_top_percent = 58`
-- `Morph_kernel = 5`
-- `Close_kernel = 0`
-- `Min_area_percent = 3`
-
-## Development Log Rule
-
-Every time Codex modifies this repository, it must update `CHANGELOG.md` with:
-
-- Date
-- Files changed
-- Summary of what changed
-- Why the change was made
-- Any known issues or follow-up work
-
-## Display
-
-The main window shows:
-
-- Original RGB frame
-- Road mask
-- Road overlay
-- Detected drivable center path from road-mask scanlines
-- Optional demo candidate path visualization
-- Debug values for road detection, center error, selected path, and path confidences
-- Curve debug values: `curve_error_px`, `turn_hint`, `near_center_x`, and `far_center_x`
-- Tracking debug values: `tracked_center_valid` and `rejected_scanlines`
-
-The center path is tracked from the bottom of the image upward. Each scanline is split into continuous road segments, and the first usable segment is allowed to anchor away from image center when `ALLOW_FIRST_ANCHOR_JUMP = True`; later scanlines still obey `MAX_CENTER_JUMP_PX`. This helps curves and edge-of-road views lock onto the visible road before enforcing continuity.
-
-## Known Limitations
-
-- This is not ML and does not understand objects semantically.
-- It depends on color and brightness contrast between road and non-road.
-- Lighting changes may require HSV tuning.
-- Candidate paths are demo paths only; the bright detected centerline is the main visual output.
-- It uses RGB only and ignores RealSense depth.
+The next step is to wrap `build_helper_output(result, turn_hint, camera_type)` in a ROS2 node and publish it as a small helper topic. The ROS2 controller should keep treating this as optional drift assistance, not as route/path planning.
