@@ -82,3 +82,16 @@ SAFE_MIN_ROAD_CONFIDENCE = 0.55
 SAFE_ERROR_DEADBAND_MM = 5.0
 SAFE_STEERING_GAIN = 0.01
 SAFE_MAX_STEERING_CORRECTION = 0.20
+
+# Yellow boundary lock keeps the blue safe corridor on the current lane side.
+# HSV yellow pixels are treated as a no-cross divider, not as road.
+USE_YELLOW_BOUNDARY_LOCK = True
+YELLOW_H_MIN = 18
+YELLOW_H_MAX = 45
+YELLOW_S_MIN = 80
+YELLOW_S_MAX = 255
+YELLOW_V_MIN = 80
+YELLOW_V_MAX = 255
+YELLOW_BOUNDARY_DILATE_PX = 7
+YELLOW_MAX_CROSSING_PIXELS = 20
+LANE_SIDE_HOLD_FRAMES = 15

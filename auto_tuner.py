@@ -38,6 +38,16 @@ from config import (
     MIN_VALID_LANE_WIDTH_MM,
     MAX_VALID_LANE_WIDTH_MM,
     SAFE_STEERING_GAIN,
+    USE_YELLOW_BOUNDARY_LOCK,
+    YELLOW_H_MIN,
+    YELLOW_H_MAX,
+    YELLOW_S_MIN,
+    YELLOW_S_MAX,
+    YELLOW_V_MIN,
+    YELLOW_V_MAX,
+    YELLOW_BOUNDARY_DILATE_PX,
+    YELLOW_MAX_CROSSING_PIXELS,
+    LANE_SIDE_HOLD_FRAMES,
     LAST_CENTER_HOLD_FRAMES,
     MAX_CENTER_JUMP_PX,
     MIN_SEGMENT_WIDTH_PX,
@@ -178,6 +188,16 @@ def normalize_config(config):
         "MIN_VALID_LANE_WIDTH_MM": MIN_VALID_LANE_WIDTH_MM,
         "MAX_VALID_LANE_WIDTH_MM": MAX_VALID_LANE_WIDTH_MM,
         "SAFE_STEERING_GAIN": SAFE_STEERING_GAIN,
+        "USE_YELLOW_BOUNDARY_LOCK": USE_YELLOW_BOUNDARY_LOCK,
+        "YELLOW_H_MIN": YELLOW_H_MIN,
+        "YELLOW_H_MAX": YELLOW_H_MAX,
+        "YELLOW_S_MIN": YELLOW_S_MIN,
+        "YELLOW_S_MAX": YELLOW_S_MAX,
+        "YELLOW_V_MIN": YELLOW_V_MIN,
+        "YELLOW_V_MAX": YELLOW_V_MAX,
+        "YELLOW_BOUNDARY_DILATE_PX": YELLOW_BOUNDARY_DILATE_PX,
+        "YELLOW_MAX_CROSSING_PIXELS": YELLOW_MAX_CROSSING_PIXELS,
+        "LANE_SIDE_HOLD_FRAMES": LANE_SIDE_HOLD_FRAMES,
     }
     for key in merged:
         if key in config:
@@ -212,6 +232,15 @@ def sanitize_config(config):
     clean["MIN_VALID_LANE_WIDTH_MM"] = round(float(clip(clean["MIN_VALID_LANE_WIDTH_MM"], 180, 260)), 1)
     clean["MAX_VALID_LANE_WIDTH_MM"] = round(float(clip(clean["MAX_VALID_LANE_WIDTH_MM"], 260, 360)), 1)
     clean["SAFE_STEERING_GAIN"] = round(float(clip(clean["SAFE_STEERING_GAIN"], 0.001, 0.05)), 4)
+    clean["YELLOW_H_MIN"] = int(clip(clean["YELLOW_H_MIN"], 0, 179))
+    clean["YELLOW_H_MAX"] = int(clip(clean["YELLOW_H_MAX"], 0, 179))
+    clean["YELLOW_S_MIN"] = int(clip(clean["YELLOW_S_MIN"], 0, 255))
+    clean["YELLOW_S_MAX"] = int(clip(clean["YELLOW_S_MAX"], 0, 255))
+    clean["YELLOW_V_MIN"] = int(clip(clean["YELLOW_V_MIN"], 0, 255))
+    clean["YELLOW_V_MAX"] = int(clip(clean["YELLOW_V_MAX"], 0, 255))
+    clean["YELLOW_BOUNDARY_DILATE_PX"] = int(clip(clean["YELLOW_BOUNDARY_DILATE_PX"], 1, 21))
+    clean["YELLOW_MAX_CROSSING_PIXELS"] = int(clip(clean["YELLOW_MAX_CROSSING_PIXELS"], 0, 200))
+    clean["LANE_SIDE_HOLD_FRAMES"] = int(clip(clean["LANE_SIDE_HOLD_FRAMES"], 1, 60))
     return clean
 
 
@@ -329,9 +358,17 @@ def evaluate_config_on_frames(frames, source_fps, config):
     rows = []
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
+    lane_side_memory = {}
     previous_turn_hint = "unknown"
     for frame_index, time_sec, frame in frames:
-        result = app.detect_road(frame, config, last_center_x, frames_since_valid, detector_config=config)
+        result = app.detect_road(
+            frame,
+            config,
+            last_center_x,
+            frames_since_valid,
+            detector_config=config,
+            lane_side_memory=lane_side_memory,
+        )
         if result.road_detected and result.road_center_x is not None:
             last_center_x = result.road_center_x
             frames_since_valid = 0
@@ -420,7 +457,9 @@ def render_best_config_video(video_path, config, folders, source_fps):
         "safe_corridor_width_px", "measured_lane_width_mm", "measured_lane_width_px",
         "lane_width_valid", "left_clearance_mm", "right_clearance_mm",
         "corridor_center_error_mm", "corridor_center_error_px", "visual_steering_correction",
-        "safe_scanline_count_valid", "safe_corridor_reason", "straight_confidence", "left_confidence", "right_confidence", "mask_area_pixels",
+        "safe_scanline_count_valid", "safe_corridor_reason", "yellow_boundary_detected",
+        "yellow_boundary_pixel_count", "yellow_boundary_enforced", "selected_lane_side",
+        "yellow_crossing_pixels", "straight_confidence", "left_confidence", "right_confidence", "mask_area_pixels",
         "mask_area_percent", "centerline_point_count", "processing_fps_estimate",
     ]
     event_fields = ["frame_index", "time_sec", "event_type", "old_value", "new_value", "notes"]
@@ -428,6 +467,7 @@ def render_best_config_video(video_path, config, folders, source_fps):
     tracker = app.PathConfidenceTracker()
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
+    lane_side_memory = {}
     previous_state = None
     next_sample_time = 0.0
     failure_count = 0
@@ -448,7 +488,14 @@ def render_best_config_video(video_path, config, folders, source_fps):
                     break
                 frame = app.resize_frame(frame)
                 time_sec = frame_index / source_fps
-                result = app.detect_road(frame, config, last_center_x, frames_since_valid, detector_config=config)
+                result = app.detect_road(
+                    frame,
+                    config,
+                    last_center_x,
+                    frames_since_valid,
+                    detector_config=config,
+                    lane_side_memory=lane_side_memory,
+                )
                 if result.road_detected and result.road_center_x is not None:
                     last_center_x = result.road_center_x
                     frames_since_valid = 0

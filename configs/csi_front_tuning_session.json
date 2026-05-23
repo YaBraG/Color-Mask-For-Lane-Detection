@@ -1,0 +1,21 @@
+{
+  "source_video": "assets\\test_video_2.mp4",
+  "last_saved_frame_index": null,
+  "config_output_path": "configs\\csi_front_tuned_config.json",
+  "good_sample_frames": [],
+  "difficult_sample_frames": [],
+  "debug_snapshot_frames": [],
+  "final_config": {
+    "H_min": 0,
+    "H_max": 174,
+    "S_min": 0,
+    "S_max": 176,
+    "V_min": 0,
+    "V_max": 101,
+    "ROI_top_percent": 67,
+    "Morph_kernel": 1,
+    "Close_kernel": 1,
+    "Min_area_percent": 1
+  },
+  "notes_for_auto_tuning": "This config should be used as the center/seed for the future auto-tuning search. Auto-tuning should explore small ranges around these values first."
+}

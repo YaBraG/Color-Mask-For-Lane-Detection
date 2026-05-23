@@ -12,6 +12,38 @@ Files changed:
 
 Summary:
 
+- Added yellow lane-line detection as a separate boundary mask with default yellow-boundary lock enabled.
+- Removed yellow pixels from the drivable road mask so lane paint is not treated as road.
+- Added lane-side clipping and lane-side memory so the ego lane side does not flicker frame-to-frame.
+- Added safe-corridor crossing checks; if the blue hallway overlaps the yellow divider, the helper becomes inactive with `safe_corridor_reason = "crosses_yellow_boundary"` and zero steering correction.
+- Added manual tuning debug toggle `y` for yellow-boundary enforcement.
+- Added yellow-boundary telemetry and `yellow_boundary_mask` frame samples for AI/debug review.
+
+Why:
+
+- The safe corridor could choose the wrong lane when the road mask detected both sides of a visible yellow line. The yellow line now acts as a hard no-cross divider unless future route logic explicitly permits crossing.
+
+Known limitations:
+
+- Yellow detection is HSV-based and may need tuning if lighting changes or lane paint appears washed out.
+- This lock prevents accidental crossing for the visual helper only; future route logic still needs an explicit way to allow intentional lane changes or turns across a yellow boundary.
+
+Follow-up work:
+
+- Add route-level permission for intentional yellow-line crossing when the QCar mission requires it.
+
+## 2026-05-22
+
+Files changed:
+
+- `config.py`
+- `main.py`
+- `auto_tuner.py`
+- `README.md`
+- `CHANGELOG.md`
+
+Summary:
+
 - Added the blue safe drivable corridor overlay as the primary local visual steering helper.
 - Added physical lane/car constraints: lane width, car width, sidewalk/line margins, safe hallway width, and valid lane-width thresholds.
 - Added corridor-based helper outputs including safe-corridor validity, helper active state, measured lane width, left/right clearance, corridor center error, and visual steering correction.

@@ -136,6 +136,19 @@ The helper only activates when the local corridor appears physically valid. If t
 
 The older candidate arrows are now secondary debug hints. The primary local steering helper output is the blue safe corridor plus `corridor_center_error_mm` and `visual_steering_correction`.
 
+## Yellow Boundary Lock
+
+The road mask can include both lanes when both sides of the yellow line have road-colored pixels. The yellow lane line is detected as a separate boundary mask and removed from the road mask, so yellow paint is never treated as drivable road.
+
+When `USE_YELLOW_BOUNDARY_LOCK = True`, the yellow line acts as a no-cross divider for the blue safe hallway. The detector keeps the lane-side region connected to the ego/front-bottom road area and uses short lane-side memory to avoid flickering between sides. If the blue corridor crosses or overlaps the yellow boundary, the helper disables itself:
+
+- `safe_corridor_valid = False`
+- `visual_helper_active = False`
+- `safe_corridor_reason = "crosses_yellow_boundary"`
+- `visual_steering_correction = 0`
+
+Manual video tuning has a debug toggle: press `y` to turn yellow-boundary enforcement on or off for comparison. Frame samples include `yellow_boundary_mask` so the road mask, ego mask, and yellow divider can be inspected separately.
+
 ## Manual Video Tuning Mode
 
 Manual video tuning plays a recorded QCar2 ride with the same 2x2 display used by the detector: original RGB, road mask, road overlay, and detected center path/debug view. It is for finding a good RGB/OpenCV/NumPy baseline config before building the future auto-tuning optimizer.

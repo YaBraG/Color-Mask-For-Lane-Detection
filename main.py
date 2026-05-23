@@ -48,6 +48,16 @@ from config import (
     SAFE_ERROR_DEADBAND_MM,
     SAFE_STEERING_GAIN,
     SAFE_MAX_STEERING_CORRECTION,
+    USE_YELLOW_BOUNDARY_LOCK,
+    YELLOW_H_MIN,
+    YELLOW_H_MAX,
+    YELLOW_S_MIN,
+    YELLOW_S_MAX,
+    YELLOW_V_MIN,
+    YELLOW_V_MAX,
+    YELLOW_BOUNDARY_DILATE_PX,
+    YELLOW_MAX_CROSSING_PIXELS,
+    LANE_SIDE_HOLD_FRAMES,
     MAX_CENTER_JUMP_PX,
     MIN_SEGMENT_WIDTH_PX,
     REALSENSE_FPS,
@@ -83,6 +93,7 @@ OPTIONAL_TRACKBAR_RANGES = {
 class RoadResult:
     raw_mask: np.ndarray
     mask: np.ndarray
+    yellow_boundary_mask: np.ndarray
     road_detected: bool
     road_confidence: float
     road_center_x: float | None
@@ -120,6 +131,11 @@ class RoadResult:
     safe_scanline_count_valid: int
     safe_scanline_rows: list[dict]
     safe_corridor_reason: str
+    yellow_boundary_detected: bool
+    yellow_boundary_pixel_count: int
+    yellow_boundary_enforced: bool
+    selected_lane_side: str
+    yellow_crossing_pixels: int
     scan_points: list[tuple[int, int, int, int]]
     boundary_points: list[tuple[int, int]]
 
@@ -474,17 +490,129 @@ def cfg_float(detector_config, name, default):
     return float(cfg_value(detector_config, name, default))
 
 
-def detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_connected_mask=None, detector_config=None):
+def build_yellow_boundary_mask(hsv, detector_config=None):
+    # Yellow lane paint is detected separately from road. The dilated mask is
+    # used as a hard no-cross divider for the safe corridor.
+    lower = np.array(
+        [
+            cfg_int(detector_config, "YELLOW_H_MIN", YELLOW_H_MIN),
+            cfg_int(detector_config, "YELLOW_S_MIN", YELLOW_S_MIN),
+            cfg_int(detector_config, "YELLOW_V_MIN", YELLOW_V_MIN),
+        ],
+        dtype=np.uint8,
+    )
+    upper = np.array(
+        [
+            cfg_int(detector_config, "YELLOW_H_MAX", YELLOW_H_MAX),
+            cfg_int(detector_config, "YELLOW_S_MAX", YELLOW_S_MAX),
+            cfg_int(detector_config, "YELLOW_V_MAX", YELLOW_V_MAX),
+        ],
+        dtype=np.uint8,
+    )
+    mask = cv2.inRange(hsv, lower, upper)
+    dilate_px = max(0, cfg_int(detector_config, "YELLOW_BOUNDARY_DILATE_PX", YELLOW_BOUNDARY_DILATE_PX))
+    if dilate_px > 0:
+        kernel_size = dilate_px if dilate_px % 2 == 1 else dilate_px + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        mask = cv2.dilate(mask, kernel, iterations=1)
+    return mask
+
+
+def estimate_lane_side(ego_debug, yellow_boundary_mask):
+    if ego_debug["ego_anchor_x"] is None or cv2.countNonZero(yellow_boundary_mask) == 0:
+        return "unknown"
+    anchor_x = int(ego_debug["ego_anchor_x"])
+    anchor_y = int(ego_debug["ego_anchor_y"])
+    y1 = max(0, anchor_y - 80)
+    y2 = min(yellow_boundary_mask.shape[0] - 1, anchor_y + 10)
+    points = cv2.findNonZero(yellow_boundary_mask[y1 : y2 + 1, :])
+    if points is None:
+        return "unknown"
+    xs = points.reshape(-1, 2)[:, 0]
+    yellow_x = float(np.median(xs))
+    if anchor_x < yellow_x:
+        return "left"
+    if anchor_x > yellow_x:
+        return "right"
+    return "unknown"
+
+
+def update_lane_side_memory(candidate_side, lane_side_memory, detector_config=None):
+    if lane_side_memory is None:
+        return candidate_side
+    hold_frames = cfg_int(detector_config, "LANE_SIDE_HOLD_FRAMES", LANE_SIDE_HOLD_FRAMES)
+    current_side = lane_side_memory.get("side", "unknown")
+    if candidate_side == "unknown":
+        lane_side_memory["hold"] = max(0, lane_side_memory.get("hold", 0) - 1)
+        return current_side if lane_side_memory.get("hold", 0) > 0 else "unknown"
+    if current_side in ("unknown", candidate_side):
+        lane_side_memory["side"] = candidate_side
+        lane_side_memory["pending"] = None
+        lane_side_memory["pending_count"] = 0
+        lane_side_memory["hold"] = hold_frames
+        return candidate_side
+    if lane_side_memory.get("pending") != candidate_side:
+        lane_side_memory["pending"] = candidate_side
+        lane_side_memory["pending_count"] = 1
+    else:
+        lane_side_memory["pending_count"] = lane_side_memory.get("pending_count", 0) + 1
+    if lane_side_memory["pending_count"] >= hold_frames:
+        lane_side_memory["side"] = candidate_side
+        lane_side_memory["pending"] = None
+        lane_side_memory["pending_count"] = 0
+        lane_side_memory["hold"] = hold_frames
+        return candidate_side
+    return current_side
+
+
+def apply_yellow_lane_side_clip(mask, yellow_boundary_mask, selected_lane_side):
+    # If the yellow line is visible, remove road pixels on the opposite side
+    # row-by-row. This keeps the safe hallway on the ego lane side even when
+    # the road mask sees both lanes.
+    if cv2.countNonZero(yellow_boundary_mask) == 0:
+        return mask
+    clipped = mask.copy()
+    height, width = mask.shape[:2]
+    for y in range(height):
+        xs = np.where(yellow_boundary_mask[y, :] > 0)[0]
+        if xs.size == 0:
+            continue
+        divider_x = int(np.median(xs))
+        if selected_lane_side == "left":
+            clipped[y, min(width - 1, divider_x + 1) :] = 0
+        elif selected_lane_side == "right":
+            clipped[y, : max(0, divider_x)] = 0
+    return clipped
+
+
+def detect_road(
+    frame,
+    settings,
+    last_center_x,
+    frames_since_valid,
+    use_ego_connected_mask=None,
+    detector_config=None,
+    use_yellow_boundary_lock=None,
+    lane_side_memory=None,
+):
     height, width = frame.shape[:2]
     roi_top = int(height * settings["ROI_top_percent"] / 100.0)
 
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    yellow_boundary_mask = build_yellow_boundary_mask(hsv, detector_config)
     lower = np.array([settings["H_min"], settings["S_min"], settings["V_min"]], dtype=np.uint8)
     upper = np.array([settings["H_max"], settings["S_max"], settings["V_max"]], dtype=np.uint8)
     full_mask = cv2.inRange(hsv, lower, upper)
 
     # Ignore the upper image area; it usually contains walls, signs, and other distractions.
     full_mask[:roi_top, :] = 0
+    yellow_boundary_mask[:roi_top, :] = 0
+    if use_yellow_boundary_lock is None:
+        use_yellow_boundary_lock = bool(cfg_value(detector_config, "USE_YELLOW_BOUNDARY_LOCK", USE_YELLOW_BOUNDARY_LOCK))
+    # Yellow lane paint is a divider, not drivable road, so yellow pixels are
+    # always removed from the road mask. The toggle only controls whether the
+    # divider is also enforced as a no-cross boundary for the safe corridor.
+    full_mask[yellow_boundary_mask > 0] = 0
 
     kernel_size = settings["Morph_kernel"]
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
@@ -499,6 +627,13 @@ def detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_conn
 
     raw_mask = full_mask.copy()
     mask, ego_debug = keep_relevant_component(full_mask, settings, use_ego_connected_mask, detector_config)
+    selected_lane_side = update_lane_side_memory(
+        estimate_lane_side(ego_debug, yellow_boundary_mask),
+        lane_side_memory,
+        detector_config,
+    )
+    if use_yellow_boundary_lock and selected_lane_side in ("left", "right"):
+        mask = apply_yellow_lane_side_clip(mask, yellow_boundary_mask, selected_lane_side)
     area = int(cv2.countNonZero(mask))
     roi_area = max(1, width * (height - roi_top))
     min_area = roi_area * settings["Min_area_percent"] / 100.0
@@ -526,7 +661,15 @@ def detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_conn
         + 0.20 * rejected_scanline_score
     )
     road_confidence = detection_quality
-    safe_corridor = estimate_safe_corridor(mask, road_confidence, ego_debug, detector_config)
+    safe_corridor = estimate_safe_corridor(
+        mask,
+        road_confidence,
+        ego_debug,
+        detector_config,
+        yellow_boundary_mask,
+        use_yellow_boundary_lock,
+        selected_lane_side,
+    )
 
     road_center_x = None
     road_center_error_px = None
@@ -557,6 +700,7 @@ def detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_conn
     return RoadResult(
         raw_mask=raw_mask,
         mask=mask,
+        yellow_boundary_mask=yellow_boundary_mask,
         road_detected=road_detected,
         road_confidence=road_confidence,
         road_center_x=road_center_x,
@@ -594,6 +738,11 @@ def detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_conn
         safe_scanline_count_valid=safe_corridor["safe_scanline_count_valid"],
         safe_scanline_rows=safe_corridor["safe_scanline_rows"],
         safe_corridor_reason=safe_corridor["safe_corridor_reason"],
+        yellow_boundary_detected=int(cv2.countNonZero(yellow_boundary_mask)) > 0,
+        yellow_boundary_pixel_count=int(cv2.countNonZero(yellow_boundary_mask)),
+        yellow_boundary_enforced=bool(use_yellow_boundary_lock),
+        selected_lane_side=selected_lane_side,
+        yellow_crossing_pixels=safe_corridor["yellow_crossing_pixels"],
         scan_points=scan_points,
         boundary_points=boundary_points,
     )
@@ -745,7 +894,15 @@ def keep_relevant_component_by_score(mask, settings):
     return np.where(labels == best_label, 255, 0).astype(np.uint8)
 
 
-def estimate_safe_corridor(mask, road_confidence, ego_debug, detector_config=None):
+def estimate_safe_corridor(
+    mask,
+    road_confidence,
+    ego_debug,
+    detector_config=None,
+    yellow_boundary_mask=None,
+    yellow_boundary_enforced=False,
+    selected_lane_side="unknown",
+):
     # The safe corridor is a physical helper, not the whole road mask. It uses
     # nearby/lower road edges to estimate a lane-like hallway that the QCar2
     # can fit through without touching sidewalk or line margins.
@@ -832,6 +989,12 @@ def estimate_safe_corridor(mask, road_confidence, ego_debug, detector_config=Non
     min_width = cfg_float(detector_config, "MIN_VALID_LANE_WIDTH_MM", MIN_VALID_LANE_WIDTH_MM)
     max_width = cfg_float(detector_config, "MAX_VALID_LANE_WIDTH_MM", MAX_VALID_LANE_WIDTH_MM)
     lane_width_valid = min_width <= measured_lane_width_mm <= max_width
+    yellow_crossing_pixels = count_safe_corridor_yellow_crossing(
+        safe_rows,
+        yellow_boundary_mask,
+        height,
+        width,
+    )
     reason = "valid"
     if not ego_debug["ego_component_found"]:
         reason = "ego_component_missing"
@@ -839,6 +1002,11 @@ def estimate_safe_corridor(mask, road_confidence, ego_debug, detector_config=Non
         reason = "low_confidence"
     elif len(safe_rows) < cfg_int(detector_config, "SAFE_MIN_VALID_SCANLINES", SAFE_MIN_VALID_SCANLINES):
         reason = "insufficient_scanlines"
+    elif (
+        yellow_boundary_enforced
+        and yellow_crossing_pixels > cfg_int(detector_config, "YELLOW_MAX_CROSSING_PIXELS", YELLOW_MAX_CROSSING_PIXELS)
+    ):
+        reason = "crosses_yellow_boundary"
     elif measured_lane_width_mm < min_width:
         reason = "too_narrow"
     elif measured_lane_width_mm > max_width:
@@ -868,6 +1036,7 @@ def estimate_safe_corridor(mask, road_confidence, ego_debug, detector_config=Non
         "safe_scanline_count_valid": len(safe_rows),
         "safe_scanline_rows": safe_rows,
         "safe_corridor_reason": reason,
+        "yellow_crossing_pixels": yellow_crossing_pixels,
     }
 
 
@@ -888,7 +1057,27 @@ def make_safe_corridor_result(reason, rows, detector_config=None):
         "safe_scanline_count_valid": len(rows),
         "safe_scanline_rows": rows,
         "safe_corridor_reason": reason,
+        "yellow_crossing_pixels": 0,
     }
+
+
+def count_safe_corridor_yellow_crossing(safe_rows, yellow_boundary_mask, height, width):
+    if yellow_boundary_mask is None or not safe_rows:
+        return 0
+    corridor_mask = np.zeros((height, width), dtype=np.uint8)
+    left_points = []
+    right_points = []
+    for row in safe_rows:
+        if "safe_left_x" not in row or "safe_right_x" not in row:
+            continue
+        y = int(row["y"])
+        left_points.append((int(round(row["safe_left_x"])), y))
+        right_points.append((int(round(row["safe_right_x"])), y))
+    if len(left_points) < 2 or len(right_points) < 2:
+        return 0
+    polygon = np.array(left_points + list(reversed(right_points)), dtype=np.int32)
+    cv2.fillPoly(corridor_mask, [polygon], 255)
+    return int(cv2.countNonZero(cv2.bitwise_and(corridor_mask, yellow_boundary_mask)))
 
 
 def estimate_scanline_centers(mask, roi_top, last_center_x=None, frames_since_valid=LAST_CENTER_HOLD_FRAMES + 1, detector_config=None):
@@ -1047,6 +1236,7 @@ def draw_visualization(frame, result, confidences, selected_path, smoothed_curve
 
     draw_detected_centerline(output, result)
     draw_safe_corridor(output, result)
+    draw_yellow_boundary(output, result)
     draw_ego_anchor_debug(output, result)
     cv2.line(output, (width // 2, height), (width // 2, int(height * 0.45)), (255, 255, 255), 1)
 
@@ -1102,6 +1292,19 @@ def draw_safe_corridor(output, result):
     for left, right in zip(left_points, right_points):
         center_points.append(((left[0] + right[0]) // 2, left[1]))
     cv2.polylines(output, [np.array(center_points, dtype=np.int32)], False, (255, 255, 255), 2, cv2.LINE_AA)
+
+
+def draw_yellow_boundary(output, result):
+    if result.yellow_boundary_pixel_count <= 0:
+        return
+    yellow_pixels = result.yellow_boundary_mask > 0
+    output[yellow_pixels] = cv2.addWeighted(
+        output[yellow_pixels],
+        0.35,
+        np.full_like(output[yellow_pixels], (0, 255, 255)),
+        0.65,
+        0,
+    )
 
 
 def draw_candidate_paths(output, confidences, selected_path):
@@ -1177,6 +1380,9 @@ def draw_debug_text(output, result, confidences, selected_path, smoothed_curve_e
         f"corridor_err_mm: {safe_fmt(result.corridor_center_error_mm)}",
         f"steer_helper: {result.visual_steering_correction:.3f}",
         f"safe_reason: {result.safe_corridor_reason}",
+        f"yellow_lock: {result.yellow_boundary_enforced}",
+        f"lane_side: {result.selected_lane_side}",
+        f"yellow_cross_px: {result.yellow_crossing_pixels}",
         f"selected_path(debug): {selected_path}",
         f"straight_confidence: {confidences['straight']:.2f}",
         f"left_confidence: {confidences['left']:.2f}",
@@ -1463,6 +1669,16 @@ def get_config_used(settings, config_source=None):
         "SAFE_ERROR_DEADBAND_MM": SAFE_ERROR_DEADBAND_MM,
         "SAFE_STEERING_GAIN": SAFE_STEERING_GAIN,
         "SAFE_MAX_STEERING_CORRECTION": SAFE_MAX_STEERING_CORRECTION,
+        "USE_YELLOW_BOUNDARY_LOCK": USE_YELLOW_BOUNDARY_LOCK,
+        "YELLOW_H_MIN": YELLOW_H_MIN,
+        "YELLOW_H_MAX": YELLOW_H_MAX,
+        "YELLOW_S_MIN": YELLOW_S_MIN,
+        "YELLOW_S_MAX": YELLOW_S_MAX,
+        "YELLOW_V_MIN": YELLOW_V_MIN,
+        "YELLOW_V_MAX": YELLOW_V_MAX,
+        "YELLOW_BOUNDARY_DILATE_PX": YELLOW_BOUNDARY_DILATE_PX,
+        "YELLOW_MAX_CROSSING_PIXELS": YELLOW_MAX_CROSSING_PIXELS,
+        "LANE_SIDE_HOLD_FRAMES": LANE_SIDE_HOLD_FRAMES,
         "CENTERLINE_SMOOTHING_ALPHA": CENTERLINE_SMOOTHING_ALPHA,
         "CURVE_DEADBAND_PX": CURVE_DEADBAND_PX,
         "CURVE_STRONG_PX": CURVE_STRONG_PX,
@@ -1554,6 +1770,11 @@ def build_telemetry_row(frame_index, time_sec, result, confidences, selected_pat
         "visual_steering_correction": f"{result.visual_steering_correction:.5f}",
         "safe_scanline_count_valid": result.safe_scanline_count_valid,
         "safe_corridor_reason": result.safe_corridor_reason,
+        "yellow_boundary_detected": result.yellow_boundary_detected,
+        "yellow_boundary_pixel_count": result.yellow_boundary_pixel_count,
+        "yellow_boundary_enforced": result.yellow_boundary_enforced,
+        "selected_lane_side": result.selected_lane_side,
+        "yellow_crossing_pixels": result.yellow_crossing_pixels,
         "selected_path": selected_path,
         "straight_confidence": f"{confidences['straight']:.4f}",
         "left_confidence": f"{confidences['left']:.4f}",
@@ -1691,6 +1912,7 @@ def save_periodic_ai_samples(frame, result, overlay, debug_frame, folder, frame_
     cv2.imwrite(str(folder / f"frame_{frame_index:06d}_original.jpg"), frame)
     cv2.imwrite(str(folder / f"frame_{frame_index:06d}_raw_mask.jpg"), result.raw_mask)
     cv2.imwrite(str(folder / f"frame_{frame_index:06d}_ego_mask.jpg"), result.mask)
+    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_yellow_boundary_mask.jpg"), result.yellow_boundary_mask)
     cv2.imwrite(str(folder / f"frame_{frame_index:06d}_overlay.jpg"), overlay)
     cv2.imwrite(str(folder / f"frame_{frame_index:06d}_debug.jpg"), debug_frame)
     cv2.imwrite(str(folder / f"frame_{frame_index:06d}_safe_corridor_debug.jpg"), debug_frame)
@@ -2011,13 +2233,15 @@ def process_video_tuning_mode(args):
     show_mask_window = False
     show_candidates = False
     use_ego_connected_mask = USE_EGO_CONNECTED_MASK
+    use_yellow_boundary_lock = USE_YELLOW_BOUNDARY_LOCK
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
+    lane_side_memory = {}
     tracker = PathConfidenceTracker()
 
     print("Manual video tuning controls:")
     print("q/ESC quit | p/SPACE pause | s save config | l load config-output | r reset")
-    print("e toggle ego-connected mask | m mask window | c secondary candidate paths")
+    print("e toggle ego-connected mask | y toggle yellow-boundary lock | m mask window | c secondary candidate paths")
     print("g good sample | f difficult sample | d debug snapshot | n/right next | b/left back")
 
     try:
@@ -2035,7 +2259,16 @@ def process_video_tuning_mode(args):
 
             frame = resize_frame(frame)
             settings = get_trackbar_settings()
-            result = detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_connected_mask, settings)
+            result = detect_road(
+                frame,
+                settings,
+                last_center_x,
+                frames_since_valid,
+                use_ego_connected_mask,
+                settings,
+                use_yellow_boundary_lock,
+                lane_side_memory,
+            )
             if result.road_detected and result.road_center_x is not None:
                 last_center_x = result.road_center_x
                 frames_since_valid = 0
@@ -2060,7 +2293,7 @@ def process_video_tuning_mode(args):
             display = build_display_grid(frame, result, debug_frame)
             cv2.putText(
                 display,
-                f"Frame {current_frame_index}/{max(0, total_frames - 1)}  speed {playback_speed:.1f}x  ego_filter {use_ego_connected_mask}",
+                f"Frame {current_frame_index}/{max(0, total_frames - 1)}  speed {playback_speed:.1f}x  ego {use_ego_connected_mask} yellow {use_yellow_boundary_lock}",
                 (12, FRAME_HEIGHT - 14),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.62,
@@ -2117,6 +2350,12 @@ def process_video_tuning_mode(args):
                 last_center_x = None
                 frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
                 print(f"Ego-connected mask {'on' if use_ego_connected_mask else 'off'}.")
+            elif key == ord("y"):
+                use_yellow_boundary_lock = not use_yellow_boundary_lock
+                lane_side_memory.clear()
+                last_center_x = None
+                frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
+                print(f"Yellow-boundary lock {'on' if use_yellow_boundary_lock else 'off'}.")
             elif key == ord("c"):
                 show_candidates = not show_candidates
             elif key in (ord("n"), 83, 2555904):
@@ -2245,6 +2484,11 @@ def process_video_source(args):
         "visual_steering_correction",
         "safe_scanline_count_valid",
         "safe_corridor_reason",
+        "yellow_boundary_detected",
+        "yellow_boundary_pixel_count",
+        "yellow_boundary_enforced",
+        "selected_lane_side",
+        "yellow_crossing_pixels",
         "selected_path",
         "straight_confidence",
         "left_confidence",
@@ -2267,6 +2511,7 @@ def process_video_source(args):
     stopped_early = False
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
+    lane_side_memory = {}
     frame_index = 0
     processed_frames = 0
     failure_saved_count = 0
@@ -2317,7 +2562,14 @@ def process_video_source(args):
                 elapsed = max(0.001, time.perf_counter() - run_start_time)
                 processing_fps = processed_frames / elapsed
 
-                result = detect_road(frame, settings, last_center_x, frames_since_valid, detector_config=settings)
+                result = detect_road(
+                    frame,
+                    settings,
+                    last_center_x,
+                    frames_since_valid,
+                    detector_config=settings,
+                    lane_side_memory=lane_side_memory,
+                )
 
                 if result.road_detected and result.road_center_x is not None:
                     last_center_x = result.road_center_x
@@ -2514,6 +2766,7 @@ def main():
     last_frame = None
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
+    lane_side_memory = {}
 
     try:
         while True:
@@ -2526,7 +2779,7 @@ def main():
 
             frame = last_frame.copy()
             settings = get_trackbar_settings()
-            result = detect_road(frame, settings, last_center_x, frames_since_valid)
+            result = detect_road(frame, settings, last_center_x, frames_since_valid, lane_side_memory=lane_side_memory)
 
             if result.road_detected and result.road_center_x is not None:
                 last_center_x = result.road_center_x
