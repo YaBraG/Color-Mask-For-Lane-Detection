@@ -5,6 +5,41 @@
 Files changed:
 
 - `main.py`
+- `tune.py`
+- `configs/csi_front_config.json`
+- `configs/realsense_config.json`
+- `README.md`
+- `CHANGELOG.md`
+
+Summary:
+
+- Split the final workflow into two active programs: `main.py` for runtime/video analysis and `tune.py` for manual tuning.
+- Removed manual tuning from the `main.py` CLI so normal runtime stays focused on detection, visualization, telemetry, and output writing.
+- Kept active runtime on JSON config files only; `config.py` remains removed from the active workflow.
+- Hid inactive helper hallway/arrow visuals by default. Inactive geometry is only drawn when `--show-inactive-helper` is passed and is labeled debug-only.
+- Changed asphalt/road mask overlay to light green so blue is reserved for the active safe hallway/path.
+- Added visualization config values for road overlay color/alpha, safe corridor color/alpha, and inactive-helper default behavior.
+- Kept `helper_output_json` telemetry and `build_helper_output(...)` as the future ROS2 payload shape.
+
+Removed/de-emphasized prototype features:
+
+- Candidate path/arrow/path-confidence logic remains removed from primary behavior.
+- Auto-tuning/trainer code remains removed from the active workflow.
+
+Known limitations:
+
+- Manual tuning still uses OpenCV desktop windows and should be run locally, not headless.
+- No ROS2 publisher exists yet; telemetry only writes the future helper payload as JSON.
+
+Follow-up work:
+
+- Convert `build_helper_output(...)` into a ROS2 node/topic while keeping the normal QCar2 controller in charge.
+
+## 2026-05-23
+
+Files changed:
+
+- `main.py`
 - `configs/csi_front_config.json`
 - `configs/realsense_config.json`
 - `README.md`

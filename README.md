@@ -21,7 +21,8 @@ py -3.13 -m pip install -r requirements.txt
 
 The active detector runtime is intentionally simple:
 
-- `main.py`: detector, visualization, tuning, video analysis, and ROS2-ready helper-output dictionary
+- `main.py`: normal runtime/analyzer and ROS2-ready helper-output dictionary
+- `tune.py`: manual tuning tool for video/webcam/RealSense RGB
 - `configs/csi_front_config.json`: CSI/front camera config for `assets/test_video_2.mp4`
 - `configs/realsense_config.json`: RealSense D435 RGB config for `assets/test_video.mp4`
 
@@ -38,7 +39,7 @@ py -3.13 main.py --source video --video assets/test_video_2.mp4 --config configs
 CSI/front manual tuning:
 
 ```powershell
-py -3.13 main.py --source video --video assets/test_video_2.mp4 --tune-video --config configs/csi_front_config.json
+py -3.13 tune.py --source video --video assets/test_video_2.mp4 --config configs/csi_front_config.json
 ```
 
 RealSense RGB video analysis:
@@ -59,6 +60,13 @@ Webcam/CSI capture testing:
 py -3.13 main.py --source webcam --camera-index 0 --config configs/csi_front_config.json
 ```
 
+Live camera tuning:
+
+```powershell
+py -3.13 tune.py --source webcam --camera-index 0 --config configs/csi_front_config.json
+py -3.13 tune.py --source realsense --config configs/realsense_config.json
+```
+
 ## Manual Tuning
 
 Manual tuning is kept because lighting and camera mounting can change. It opens the video, shows the 2x2 debug view, and exposes HSV/mask trackbars.
@@ -75,6 +83,16 @@ Useful keys:
 - `q` or `ESC`: quit
 
 When `--config-output` is omitted, pressing `s` saves back to the file passed with `--config`.
+
+## Visual Colors
+
+The default view keeps the final helper signal clean:
+
+- light green: detected asphalt/road mask
+- blue: active safe hallway/path only
+- yellow: yellow lane divider/no-cross boundary
+
+When `visual_helper_active = False`, the blue hallway and helper arrow are hidden by default. Use `--show-inactive-helper` with `main.py` or `tune.py` only when debugging inactive geometry; inactive helper drawings are faint and labeled debug-only.
 
 ## Blue Safe Corridor
 
@@ -149,4 +167,4 @@ Telemetry includes a `helper_output_json` field. That dictionary is the future R
 
 ## Future ROS2 Port
 
-The next step is to wrap `build_helper_output(result, turn_hint, camera_type)` in a ROS2 node and publish it as a small helper topic. The ROS2 controller should keep treating this as optional drift assistance, not as route/path planning.
+The next step is to wrap `build_helper_output(result, config)` in a ROS2 node and publish it as a small helper topic. The ROS2 controller should keep treating this as optional drift assistance, not as route/path planning.

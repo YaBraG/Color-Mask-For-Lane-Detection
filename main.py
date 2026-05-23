@@ -114,6 +114,13 @@ DEFAULT_SETTINGS = {
     "DRIFT_DISABLE_ON_TURN_HINT": True,
     "DRIFT_HELPER_GAIN": 0.01,
     "DRIFT_HELPER_MAX_OUTPUT": 0.20,
+    "ROAD_OVERLAY_COLOR_BGR": [120, 255, 120],
+    "ROAD_OVERLAY_ALPHA": 0.35,
+    "ACTIVE_SAFE_CORRIDOR_COLOR_BGR": [255, 130, 20],
+    "ACTIVE_SAFE_CORRIDOR_ALPHA": 0.42,
+    "INACTIVE_SAFE_CORRIDOR_COLOR_BGR": [140, 120, 100],
+    "INACTIVE_SAFE_CORRIDOR_ALPHA": 0.18,
+    "SHOW_INACTIVE_HELPER_DEFAULT": False,
 }
 
 TRACKBAR_RANGES = {
@@ -361,9 +368,9 @@ def parse_args():
     parser.add_argument("--output-dir", default="outputs", help="Folder where video-mode outputs are written.")
     parser.add_argument("--no-display", action="store_true", help="Process video without opening OpenCV windows.")
     parser.add_argument(
-        "--tune-video",
+        "--show-inactive-helper",
         action="store_true",
-        help="Open an interactive manual tuning mode for --source video instead of full analysis.",
+        help="Draw faint inactive helper geometry for debugging. Hidden by default.",
     )
     parser.add_argument(
         "--use-default-config",
@@ -375,10 +382,6 @@ def parse_args():
         default=CONFIG_FILE,
         help="Camera config JSON to load. Defaults to configs/csi_front_config.json.",
     )
-    parser.add_argument("--config-output", help="Where manual video tuning saves settings. Defaults to --config.")
-    parser.add_argument("--session-output", default="configs/manual_tuning_session.json", help="Where manual video tuning saves session notes and sample frame lists.")
-    parser.add_argument("--start-frame", type=int, default=0, help="Frame index where manual video tuning starts.")
-    parser.add_argument("--playback-speed", type=float, default=1.0, help="Manual tuning playback speed multiplier.")
     parser.add_argument(
         "--clean-output",
         action="store_true",
@@ -499,7 +502,12 @@ def config_values_from_payload(payload):
         settings["config_name"] = payload["name"]
     for name, default in DEFAULT_SETTINGS.items():
         if name in values:
-            settings[name] = values[name] if isinstance(default, str) else type(default)(values[name])
+            if isinstance(default, list):
+                settings[name] = list(values[name])
+            elif isinstance(default, str):
+                settings[name] = values[name]
+            else:
+                settings[name] = type(default)(values[name])
     for name in TRACKBAR_RANGES:
         if name in values:
             settings[name] = int(values[name])
@@ -537,6 +545,17 @@ def cfg_int(detector_config, name, default):
 
 def cfg_float(detector_config, name, default):
     return float(cfg_value(detector_config, name, default))
+
+
+def cfg_bool(detector_config, name, default=False):
+    return bool(cfg_value(detector_config, name, default))
+
+
+def cfg_color(detector_config, name, default):
+    value = cfg_value(detector_config, name, default)
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        return tuple(int(clamp(int(component), 0, 255)) for component in value)
+    return tuple(default)
 
 
 def build_yellow_boundary_mask(hsv, detector_config=None):
@@ -1498,19 +1517,20 @@ def smooth_centerline_points(raw_points, detector_config=None):
     return smoothed_points
 
 
-def draw_visualization(frame, result, turn_hint):
+def draw_visualization(frame, result, turn_hint, settings=None, show_inactive_helper=False):
     output = frame.copy()
     height, width = output.shape[:2]
 
     road_color = np.zeros_like(output)
-    road_color[:, :] = (180, 120, 0)
-    output = np.where(result.mask[:, :, None] > 0, cv2.addWeighted(output, 0.55, road_color, 0.45, 0), output)
+    road_color[:, :] = cfg_color(settings, "ROAD_OVERLAY_COLOR_BGR", DEFAULT_SETTINGS["ROAD_OVERLAY_COLOR_BGR"])
+    road_alpha = cfg_float(settings, "ROAD_OVERLAY_ALPHA", DEFAULT_SETTINGS["ROAD_OVERLAY_ALPHA"])
+    output = np.where(result.mask[:, :, None] > 0, cv2.addWeighted(output, 1.0 - road_alpha, road_color, road_alpha, 0), output)
 
     for left_x, y in result.boundary_points:
         cv2.circle(output, (left_x, y), 4, (0, 255, 255), -1)
 
-    draw_detected_centerline(output, result)
-    draw_safe_corridor(output, result)
+    draw_detected_centerline(output, result, show_inactive_helper)
+    draw_safe_corridor(output, result, settings, show_inactive_helper)
     draw_yellow_boundary(output, result)
     draw_ego_anchor_debug(output, result)
     cv2.line(output, (width // 2, height), (width // 2, int(height * 0.45)), (255, 255, 255), 1)
@@ -1537,7 +1557,9 @@ def draw_ego_anchor_debug(output, result):
         )
 
 
-def draw_safe_corridor(output, result):
+def draw_safe_corridor(output, result, settings=None, show_inactive_helper=False):
+    if not result.visual_helper_active and not show_inactive_helper:
+        return
     if not result.safe_scanline_rows:
         return
 
@@ -1555,18 +1577,27 @@ def draw_safe_corridor(output, result):
 
     polygon = np.array(left_points + list(reversed(right_points)), dtype=np.int32)
     overlay = output.copy()
-    fill_color = (255, 130, 20) if result.safe_corridor_valid else (120, 80, 60)
-    edge_color = (255, 200, 40) if result.safe_corridor_valid else (140, 120, 100)
+    active_color = cfg_color(settings, "ACTIVE_SAFE_CORRIDOR_COLOR_BGR", DEFAULT_SETTINGS["ACTIVE_SAFE_CORRIDOR_COLOR_BGR"])
+    inactive_color = cfg_color(settings, "INACTIVE_SAFE_CORRIDOR_COLOR_BGR", DEFAULT_SETTINGS["INACTIVE_SAFE_CORRIDOR_COLOR_BGR"])
+    fill_color = active_color if result.visual_helper_active else inactive_color
+    edge_color = (255, 220, 80) if result.visual_helper_active else inactive_color
     cv2.fillPoly(overlay, [polygon], fill_color)
-    alpha = 0.42 if result.safe_corridor_valid else 0.22
+    alpha = (
+        cfg_float(settings, "ACTIVE_SAFE_CORRIDOR_ALPHA", DEFAULT_SETTINGS["ACTIVE_SAFE_CORRIDOR_ALPHA"])
+        if result.visual_helper_active
+        else cfg_float(settings, "INACTIVE_SAFE_CORRIDOR_ALPHA", DEFAULT_SETTINGS["INACTIVE_SAFE_CORRIDOR_ALPHA"])
+    )
     cv2.addWeighted(overlay, alpha, output, 1.0 - alpha, 0, output)
-    cv2.polylines(output, [np.array(left_points, dtype=np.int32)], False, edge_color, 3, cv2.LINE_AA)
-    cv2.polylines(output, [np.array(right_points, dtype=np.int32)], False, edge_color, 3, cv2.LINE_AA)
+    thickness = 3 if result.visual_helper_active else 1
+    cv2.polylines(output, [np.array(left_points, dtype=np.int32)], False, edge_color, thickness, cv2.LINE_AA)
+    cv2.polylines(output, [np.array(right_points, dtype=np.int32)], False, edge_color, thickness, cv2.LINE_AA)
 
     center_points = []
     for left, right in zip(left_points, right_points):
         center_points.append(((left[0] + right[0]) // 2, left[1]))
-    cv2.polylines(output, [np.array(center_points, dtype=np.int32)], False, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.polylines(output, [np.array(center_points, dtype=np.int32)], False, (255, 255, 255), 2 if result.visual_helper_active else 1, cv2.LINE_AA)
+    if not result.visual_helper_active:
+        cv2.putText(output, "INACTIVE DEBUG ONLY", center_points[-1], cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 2, cv2.LINE_AA)
 
 
 def draw_yellow_boundary(output, result):
@@ -1591,7 +1622,7 @@ def draw_yellow_boundary(output, result):
         cv2.putText(output, "WIDE BLOB NO YELLOW - HELPER OFF", (output.shape[1] - 520, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 255), 2, cv2.LINE_AA)
 
 
-def draw_detected_centerline(output, result):
+def draw_detected_centerline(output, result, show_inactive_helper=False):
     if not result.scan_points:
         return
 
@@ -1599,7 +1630,7 @@ def draw_detected_centerline(output, result):
     centerline_points = [(int(center_x), int(y)) for center_x, _left_x, _right_x, y in result.scan_points]
     path_points = [(width // 2, height - 8)] + centerline_points
 
-    if len(path_points) >= 2:
+    if result.visual_helper_active and len(path_points) >= 2:
         path_array = np.array(path_points, dtype=np.int32)
         # Draw a dark outline first so the real detected path stays readable
         # over both the camera image and the semi-transparent road overlay.
@@ -1617,6 +1648,10 @@ def draw_detected_centerline(output, result):
             cv2.LINE_AA,
             tipLength=0.35,
         )
+
+    elif show_inactive_helper and len(path_points) >= 2:
+        path_array = np.array(path_points, dtype=np.int32)
+        cv2.polylines(output, [path_array], False, (120, 120, 120), 1, cv2.LINE_AA)
 
     for x, y in centerline_points:
         cv2.circle(output, (x, y), 5, (0, 255, 0), -1)
@@ -1678,9 +1713,9 @@ def safe_fmt(value):
     return f"{float(value):.1f}"
 
 
-def build_display_grid(original, result, visualization):
+def build_display_grid(original, result, visualization, settings=None, show_inactive_helper=False):
     mask_bgr = cv2.cvtColor(result.mask, cv2.COLOR_GRAY2BGR)
-    road_overlay = build_road_overlay(original, result)
+    road_overlay = build_road_overlay(original, result, settings, show_inactive_helper)
 
     top = np.hstack([label_image(original, "Original RGB"), label_image(mask_bgr, "Road Mask")])
     bottom = np.hstack([label_image(road_overlay, "Road Overlay"), label_image(visualization, "Safe Corridor Debug")])
@@ -1906,21 +1941,23 @@ def save_config_used(path, settings, config_source):
         json.dump(get_config_used(settings, config_source), file, indent=2)
 
 
-def build_road_overlay(frame, mask_or_result):
+def build_road_overlay(frame, mask_or_result, settings=None, show_inactive_helper=False):
     overlay = frame.copy()
     result = mask_or_result if hasattr(mask_or_result, "mask") else None
     mask = result.mask if result is not None else mask_or_result
     mask_pixels = mask > 0
     if np.any(mask_pixels):
+        road_color = cfg_color(settings, "ROAD_OVERLAY_COLOR_BGR", DEFAULT_SETTINGS["ROAD_OVERLAY_COLOR_BGR"])
+        road_alpha = cfg_float(settings, "ROAD_OVERLAY_ALPHA", DEFAULT_SETTINGS["ROAD_OVERLAY_ALPHA"])
         overlay[mask_pixels] = cv2.addWeighted(
             overlay[mask_pixels],
-            0.45,
-            np.full_like(overlay[mask_pixels], (180, 120, 0)),
-            0.55,
+            1.0 - road_alpha,
+            np.full_like(overlay[mask_pixels], road_color),
+            road_alpha,
             0,
         )
     if result is not None:
-        draw_safe_corridor(overlay, result)
+        draw_safe_corridor(overlay, result, settings, show_inactive_helper)
     return overlay
 
 
@@ -1934,8 +1971,12 @@ def is_json_scalar(value):
     return isinstance(value, (str, int, float, bool)) or value is None
 
 
-def build_helper_output(result, turn_hint, camera_type, timestamp=None):
+def build_helper_output(result, config=None, timestamp=None, turn_hint=None):
     """Return the future ROS2 payload as a plain JSON-serializable dict."""
+    config = config or {}
+    if turn_hint is None:
+        turn_hint = compute_turn_hint(result.curve_error_px, config)
+    camera_type = str(config.get("camera_type", "unknown"))
     return {
         "timestamp": timestamp,
         "road_detected": bool(result.road_detected),
@@ -1954,7 +1995,7 @@ def build_helper_output(result, turn_hint, camera_type, timestamp=None):
     }
 
 
-def build_telemetry_row(frame_index, time_sec, result, turn_hint, processing_fps, camera_type="unknown"):
+def build_telemetry_row(frame_index, time_sec, result, turn_hint, processing_fps, camera_type="unknown", settings=None):
     height, width = result.mask.shape[:2]
     mask_area_pixels = int(cv2.countNonZero(result.mask))
     mask_area_percent = mask_area_pixels / max(1, width * height) * 100.0
@@ -2023,7 +2064,10 @@ def build_telemetry_row(frame_index, time_sec, result, turn_hint, processing_fps
         "right_space_mm": safe_number(result.right_space_mm),
         "unphysical_corridor_geometry": result.unphysical_corridor_geometry,
         "steering_saturation_count": result.steering_saturation_count,
-        "helper_output_json": json.dumps(build_helper_output(result, turn_hint, camera_type, time_sec), sort_keys=True),
+        "helper_output_json": json.dumps(
+            build_helper_output(result, settings or {"camera_type": camera_type}, timestamp=time_sec, turn_hint=turn_hint),
+            sort_keys=True,
+        ),
         "mask_area_pixels": mask_area_pixels,
         "mask_area_percent": f"{mask_area_percent:.4f}",
         "centerline_point_count": len(result.scan_points),
@@ -2469,7 +2513,7 @@ def process_video_tuning_mode(args):
     # user pauses on hard frames, adjusts simple RGB/OpenCV/NumPy mask values,
     # and saves a camera config for later video analysis or ROS2 porting.
     if not args.video:
-        raise RuntimeError("--video is required when using --tune-video")
+        raise RuntimeError("--video is required when tuning a video source")
     video_path = Path(args.video)
     if not video_path.exists():
         raise RuntimeError(f"Could not find video: {video_path}")
@@ -2556,9 +2600,10 @@ def process_video_tuning_mode(args):
 
             turn_hint = compute_turn_hint(result.curve_error_px, settings)
             apply_drift_only_gate(result, turn_hint, drift_state, settings)
-            debug_frame = draw_visualization(frame, result, turn_hint)
-            overlay = build_road_overlay(frame, result)
-            display = build_display_grid(frame, result, debug_frame)
+            show_inactive_helper = getattr(args, "show_inactive_helper", False) or cfg_bool(settings, "SHOW_INACTIVE_HELPER_DEFAULT", False)
+            debug_frame = draw_visualization(frame, result, turn_hint, settings, show_inactive_helper)
+            overlay = build_road_overlay(frame, result, settings, show_inactive_helper)
+            display = build_display_grid(frame, result, debug_frame, settings, show_inactive_helper)
             cv2.putText(
                 display,
                 f"Frame {current_frame_index}/{max(0, total_frames - 1)}  speed {playback_speed:.1f}x  ego {use_ego_connected_mask} yellow {use_yellow_boundary_lock}",
@@ -2857,8 +2902,9 @@ def process_video_source(args):
 
                 turn_hint = compute_turn_hint(result.curve_error_px, settings)
                 apply_drift_only_gate(result, turn_hint, drift_state, settings)
-                debug_frame = draw_visualization(frame, result, turn_hint)
-                overlay = build_road_overlay(frame, result)
+                show_inactive_helper = args.show_inactive_helper or cfg_bool(settings, "SHOW_INACTIVE_HELPER_DEFAULT", False)
+                debug_frame = draw_visualization(frame, result, turn_hint, settings, show_inactive_helper)
+                overlay = build_road_overlay(frame, result, settings, show_inactive_helper)
                 writer.write(debug_frame)
                 last_debug_frame = debug_frame.copy()
 
@@ -2869,6 +2915,7 @@ def process_video_source(args):
                     turn_hint,
                     processing_fps,
                     camera_type=str(settings.get("camera_type", "unknown")),
+                    settings=settings,
                 )
                 write_telemetry_row(telemetry_writer, telemetry_row)
                 rows.append(telemetry_row)
@@ -2933,7 +2980,7 @@ def process_video_source(args):
                     last_progress_time = now
 
                 if not args.no_display:
-                    cv2.imshow(WINDOW_MAIN, build_display_grid(frame, result, debug_frame))
+                    cv2.imshow(WINDOW_MAIN, build_display_grid(frame, result, debug_frame, settings, show_inactive_helper))
                     if show_mask_window:
                         cv2.imshow(WINDOW_MASK, result.mask)
                     else:
@@ -3000,8 +3047,6 @@ def main():
 
     if args.source == "video":
         try:
-            if args.tune_video:
-                return process_video_tuning_mode(args)
             return process_video_source(args)
         except RuntimeError as exc:
             print(f"ERROR: {exc}")
@@ -3054,8 +3099,9 @@ def main():
 
             turn_hint = compute_turn_hint(result.curve_error_px, settings)
             apply_drift_only_gate(result, turn_hint, drift_state, settings)
-            visualization = draw_visualization(frame, result, turn_hint)
-            display = build_display_grid(frame, result, visualization)
+            show_inactive_helper = args.show_inactive_helper or cfg_bool(settings, "SHOW_INACTIVE_HELPER_DEFAULT", False)
+            visualization = draw_visualization(frame, result, turn_hint, settings, show_inactive_helper)
+            display = build_display_grid(frame, result, visualization, settings, show_inactive_helper)
             cv2.imshow(WINDOW_MAIN, display)
 
             if show_mask_window:
