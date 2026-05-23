@@ -4,6 +4,35 @@
 
 Files changed:
 
+- `config.py`
+- `main.py`
+- `auto_tuner.py`
+- `README.md`
+- `CHANGELOG.md`
+
+Summary:
+
+- Added the blue safe drivable corridor overlay as the primary local visual steering helper.
+- Added physical lane/car constraints: lane width, car width, sidewalk/line margins, safe hallway width, and valid lane-width thresholds.
+- Added corridor-based helper outputs including safe-corridor validity, helper active state, measured lane width, left/right clearance, corridor center error, and visual steering correction.
+- Added gating behavior so the helper turns off and outputs zero correction in wide, narrow, low-confidence, ego-missing, or insufficient-scanline areas.
+- Added safe-corridor telemetry, AI summary metrics, human summary metrics, frame samples, and failure events.
+- Reduced old candidate arrows to secondary debug output; they are no longer the main local steering helper.
+
+Known limitations:
+
+- The mm conversion is a simple row-local calibration from detected lane width, not a full camera calibration or homography.
+- The helper is logged and visualized only; it is not connected to QCar control yet.
+- Wide physically connected branches may still need map/path guidance.
+
+Follow-up work:
+
+- Later integrate `visual_steering_correction` with the actual QCar controller after validating the blue corridor on front CSI camera video.
+
+## 2026-05-22
+
+Files changed:
+
 - `main.py`
 - `auto_tuner.py`
 - `scoring.py`

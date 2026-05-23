@@ -30,6 +30,14 @@ from config import (
     EGO_SEED_SEARCH_RADIUS_PX,
     FRAME_HEIGHT,
     FRAME_WIDTH,
+    LANE_WIDTH_MM,
+    CAR_WIDTH_MM,
+    SIDEWALK_MARGIN_MM,
+    LINE_MARGIN_MM,
+    SAFE_HALLWAY_WIDTH_MM,
+    MIN_VALID_LANE_WIDTH_MM,
+    MAX_VALID_LANE_WIDTH_MM,
+    SAFE_STEERING_GAIN,
     LAST_CENTER_HOLD_FRAMES,
     MAX_CENTER_JUMP_PX,
     MIN_SEGMENT_WIDTH_PX,
@@ -162,6 +170,14 @@ def normalize_config(config):
         "EGO_SEED_SEARCH_RADIUS_PX": EGO_SEED_SEARCH_RADIUS_PX,
         "EGO_BOTTOM_BAND_PERCENT": EGO_BOTTOM_BAND_PERCENT,
         "EGO_MIN_COMPONENT_AREA_PERCENT": EGO_MIN_COMPONENT_AREA_PERCENT,
+        "LANE_WIDTH_MM": LANE_WIDTH_MM,
+        "CAR_WIDTH_MM": CAR_WIDTH_MM,
+        "SIDEWALK_MARGIN_MM": SIDEWALK_MARGIN_MM,
+        "LINE_MARGIN_MM": LINE_MARGIN_MM,
+        "SAFE_HALLWAY_WIDTH_MM": SAFE_HALLWAY_WIDTH_MM,
+        "MIN_VALID_LANE_WIDTH_MM": MIN_VALID_LANE_WIDTH_MM,
+        "MAX_VALID_LANE_WIDTH_MM": MAX_VALID_LANE_WIDTH_MM,
+        "SAFE_STEERING_GAIN": SAFE_STEERING_GAIN,
     }
     for key in merged:
         if key in config:
@@ -193,6 +209,9 @@ def sanitize_config(config):
     clean["EGO_SEED_SEARCH_RADIUS_PX"] = int(clip(clean["EGO_SEED_SEARCH_RADIUS_PX"], 80, 180))
     clean["EGO_BOTTOM_BAND_PERCENT"] = int(clip(clean["EGO_BOTTOM_BAND_PERCENT"], 8, 30))
     clean["EGO_MIN_COMPONENT_AREA_PERCENT"] = round(float(clip(clean["EGO_MIN_COMPONENT_AREA_PERCENT"], 0.5, 3.0)), 2)
+    clean["MIN_VALID_LANE_WIDTH_MM"] = round(float(clip(clean["MIN_VALID_LANE_WIDTH_MM"], 180, 260)), 1)
+    clean["MAX_VALID_LANE_WIDTH_MM"] = round(float(clip(clean["MAX_VALID_LANE_WIDTH_MM"], 260, 360)), 1)
+    clean["SAFE_STEERING_GAIN"] = round(float(clip(clean["SAFE_STEERING_GAIN"], 0.001, 0.05)), 4)
     return clean
 
 
@@ -397,7 +416,11 @@ def render_best_config_video(video_path, config, folders, source_fps):
         "first_anchor_x", "first_anchor_distance_px", "ego_component_found", "ego_seed_x",
         "ego_seed_y", "ego_anchor_x", "ego_anchor_y", "ego_component_area_pixels",
         "ego_component_area_percent", "ego_component_fallback_used", "selected_path",
-        "straight_confidence", "left_confidence", "right_confidence", "mask_area_pixels",
+        "safe_corridor_valid", "visual_helper_active", "safe_corridor_width_mm",
+        "safe_corridor_width_px", "measured_lane_width_mm", "measured_lane_width_px",
+        "lane_width_valid", "left_clearance_mm", "right_clearance_mm",
+        "corridor_center_error_mm", "corridor_center_error_px", "visual_steering_correction",
+        "safe_scanline_count_valid", "safe_corridor_reason", "straight_confidence", "left_confidence", "right_confidence", "mask_area_pixels",
         "mask_area_percent", "centerline_point_count", "processing_fps_estimate",
     ]
     event_fields = ["frame_index", "time_sec", "event_type", "old_value", "new_value", "notes"]
@@ -437,7 +460,7 @@ def render_best_config_video(video_path, config, folders, source_fps):
                     result.road_detected,
                 )
                 debug_frame = app.draw_visualization(frame, result, confidences, selected_path, smoothed_curve_error_px, turn_hint, False)
-                overlay = app.build_road_overlay(frame, result.mask)
+                overlay = app.build_road_overlay(frame, result)
                 writer.write(debug_frame)
                 processing_fps = frame_index / max(0.001, time.perf_counter() - started)
                 telemetry_writer.writerow(app.build_telemetry_row(frame_index, time_sec, result, confidences, selected_path, turn_hint, processing_fps))

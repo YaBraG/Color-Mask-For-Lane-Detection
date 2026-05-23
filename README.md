@@ -115,6 +115,27 @@ This filtered mask is what centerline tracking uses, so disconnected side-road b
 
 If a side area is physically connected to the main road, ego filtering alone may still include it. The scanline tracker still enforces centerline continuity with `MAX_CENTER_JUMP_PX` after the first anchor, but future map/path guidance may be needed for complex connected branches.
 
+## Safe Space Drivable Area
+
+The road mask can be wider than the lane the QCar2 should actually use. Intersections, parking-lot-like areas, and side branches may all be valid road-colored pixels, but they are not necessarily a safe local corridor.
+
+The blue hallway is the safe space drivable area. It is based on the ego-connected road mask, nearby lower scanline road edges, and known physical dimensions:
+
+- `LANE_WIDTH_MM = 254.0`
+- `CAR_WIDTH_MM = 203.2`
+- `SAFE_HALLWAY_WIDTH_MM = 227.2`
+
+The safe hallway width is the car width plus a `12 mm` sidewalk margin and a `12 mm` line margin. The detector estimates local left/right road edges, converts nearby pixel widths to millimeters using the known lane width, and computes:
+
+- left/right clearance in mm
+- corridor center error in mm
+- `visual_steering_correction`
+- whether the visual helper is active
+
+The helper only activates when the local corridor appears physically valid. If the measured lane is too narrow, too wide, low-confidence, missing ego connection, or has too few usable lower scanlines, `safe_corridor_valid = False`, `visual_helper_active = False`, and `visual_steering_correction = 0`. In those wide or ambiguous areas, the normal controller is expected to remain in charge.
+
+The older candidate arrows are now secondary debug hints. The primary local steering helper output is the blue safe corridor plus `corridor_center_error_mm` and `visual_steering_correction`.
+
 ## Manual Video Tuning Mode
 
 Manual video tuning plays a recorded QCar2 ride with the same 2x2 display used by the detector: original RGB, road mask, road overlay, and detected center path/debug view. It is for finding a good RGB/OpenCV/NumPy baseline config before building the future auto-tuning optimizer.

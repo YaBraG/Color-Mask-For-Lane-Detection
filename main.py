@@ -32,6 +32,22 @@ from config import (
     FRAME_HEIGHT,
     FRAME_WIDTH,
     LAST_CENTER_HOLD_FRAMES,
+    LANE_WIDTH_MM,
+    CAR_WIDTH_MM,
+    SIDEWALK_MARGIN_MM,
+    LINE_MARGIN_MM,
+    SAFE_HALLWAY_WIDTH_MM,
+    MIN_VALID_LANE_WIDTH_MM,
+    MAX_VALID_LANE_WIDTH_MM,
+    SAFE_SCANLINE_COUNT,
+    SAFE_SCANLINE_START_RATIO,
+    SAFE_SCANLINE_END_RATIO,
+    SAFE_SCANLINE_NEAR_WEIGHT_BIAS,
+    SAFE_MIN_VALID_SCANLINES,
+    SAFE_MIN_ROAD_CONFIDENCE,
+    SAFE_ERROR_DEADBAND_MM,
+    SAFE_STEERING_GAIN,
+    SAFE_MAX_STEERING_CORRECTION,
     MAX_CENTER_JUMP_PX,
     MIN_SEGMENT_WIDTH_PX,
     REALSENSE_FPS,
@@ -89,6 +105,21 @@ class RoadResult:
     ego_component_area_pixels: int
     ego_component_area_percent: float
     ego_component_fallback_used: bool
+    safe_corridor_valid: bool
+    visual_helper_active: bool
+    safe_corridor_width_mm: float
+    safe_corridor_width_px: float | None
+    measured_lane_width_mm: float | None
+    measured_lane_width_px: float | None
+    lane_width_valid: bool
+    left_clearance_mm: float | None
+    right_clearance_mm: float | None
+    corridor_center_error_mm: float | None
+    corridor_center_error_px: float | None
+    visual_steering_correction: float
+    safe_scanline_count_valid: int
+    safe_scanline_rows: list[dict]
+    safe_corridor_reason: str
     scan_points: list[tuple[int, int, int, int]]
     boundary_points: list[tuple[int, int]]
 
@@ -326,7 +357,7 @@ def print_startup(args):
     print("QCar2 RGB Road Detector")
     print("-----------------------")
     print(f"Source: {args.source}")
-    print("Keys: q/ESC quit | s save HSV | l load HSV | r reset HSV | m mask | p pause | c candidates")
+    print("Keys: q/ESC quit | s save HSV | l load HSV | r reset HSV | m mask | p pause | c secondary candidates")
     print("Tune HSV until road is white in the mask and non-road is black.")
     print()
 
@@ -495,6 +526,7 @@ def detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_conn
         + 0.20 * rejected_scanline_score
     )
     road_confidence = detection_quality
+    safe_corridor = estimate_safe_corridor(mask, road_confidence, ego_debug, detector_config)
 
     road_center_x = None
     road_center_error_px = None
@@ -547,6 +579,21 @@ def detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_conn
         ego_component_area_pixels=ego_debug["ego_component_area_pixels"],
         ego_component_area_percent=ego_debug["ego_component_area_percent"],
         ego_component_fallback_used=ego_debug["ego_component_fallback_used"],
+        safe_corridor_valid=safe_corridor["safe_corridor_valid"],
+        visual_helper_active=safe_corridor["visual_helper_active"],
+        safe_corridor_width_mm=safe_corridor["safe_corridor_width_mm"],
+        safe_corridor_width_px=safe_corridor["safe_corridor_width_px"],
+        measured_lane_width_mm=safe_corridor["measured_lane_width_mm"],
+        measured_lane_width_px=safe_corridor["measured_lane_width_px"],
+        lane_width_valid=safe_corridor["lane_width_valid"],
+        left_clearance_mm=safe_corridor["left_clearance_mm"],
+        right_clearance_mm=safe_corridor["right_clearance_mm"],
+        corridor_center_error_mm=safe_corridor["corridor_center_error_mm"],
+        corridor_center_error_px=safe_corridor["corridor_center_error_px"],
+        visual_steering_correction=safe_corridor["visual_steering_correction"],
+        safe_scanline_count_valid=safe_corridor["safe_scanline_count_valid"],
+        safe_scanline_rows=safe_corridor["safe_scanline_rows"],
+        safe_corridor_reason=safe_corridor["safe_corridor_reason"],
         scan_points=scan_points,
         boundary_points=boundary_points,
     )
@@ -696,6 +743,152 @@ def keep_relevant_component_by_score(mask, settings):
         return np.zeros_like(mask)
 
     return np.where(labels == best_label, 255, 0).astype(np.uint8)
+
+
+def estimate_safe_corridor(mask, road_confidence, ego_debug, detector_config=None):
+    # The safe corridor is a physical helper, not the whole road mask. It uses
+    # nearby/lower road edges to estimate a lane-like hallway that the QCar2
+    # can fit through without touching sidewalk or line margins.
+    height, width = mask.shape[:2]
+    image_center_x = width / 2.0
+    rows = np.linspace(
+        int(height * cfg_float(detector_config, "SAFE_SCANLINE_END_RATIO", SAFE_SCANLINE_END_RATIO)),
+        int(height * cfg_float(detector_config, "SAFE_SCANLINE_START_RATIO", SAFE_SCANLINE_START_RATIO)),
+        cfg_int(detector_config, "SAFE_SCANLINE_COUNT", SAFE_SCANLINE_COUNT),
+    ).astype(int)
+
+    safe_rows = []
+    for index, y in enumerate(rows):
+        y = min(max(0, int(y)), height - 1)
+        segments = find_road_segments(mask[y, :], cfg_int(detector_config, "MIN_SEGMENT_WIDTH_PX", MIN_SEGMENT_WIDTH_PX))
+        if not segments:
+            continue
+        left_x, right_x, segment_center_x = min(segments, key=lambda segment: abs(segment[2] - image_center_x))
+        lane_width_px = max(1.0, float(right_x - left_x))
+        safe_rows.append(
+            {
+                "y": y,
+                "left_x": int(left_x),
+                "right_x": int(right_x),
+                "center_x": float(segment_center_x),
+                "lane_width_px": lane_width_px,
+                # Lower rows are closer to the car, so they should dominate
+                # the helper correction more than farther scanlines.
+                "weight": cfg_float(detector_config, "SAFE_SCANLINE_NEAR_WEIGHT_BIAS", SAFE_SCANLINE_NEAR_WEIGHT_BIAS) - (index / max(1, len(rows) - 1)),
+            }
+        )
+
+    if not safe_rows:
+        return make_safe_corridor_result("edge_detection_failed", [], detector_config)
+
+    weights = np.array([row["weight"] for row in safe_rows], dtype=np.float32)
+    widths_px = np.array([row["lane_width_px"] for row in safe_rows], dtype=np.float32)
+    reference_width_px = float(np.median(widths_px))
+    if reference_width_px <= 0:
+        return make_safe_corridor_result("edge_detection_failed", safe_rows, detector_config)
+
+    lane_width_mm_values = []
+    left_clearances = []
+    right_clearances = []
+    center_errors_mm = []
+    center_errors_px = []
+    safe_width_px_values = []
+    safe_width_mm = cfg_float(detector_config, "SAFE_HALLWAY_WIDTH_MM", SAFE_HALLWAY_WIDTH_MM)
+    lane_width_mm = cfg_float(detector_config, "LANE_WIDTH_MM", LANE_WIDTH_MM)
+
+    for row in safe_rows:
+        # Row-local scale is intentionally simple: the detected lane width at
+        # this row maps to the known physical lane width. This avoids full
+        # camera calibration/homography while still producing useful mm values.
+        local_mm_per_px = lane_width_mm / max(1.0, row["lane_width_px"])
+        reference_mm_per_px = lane_width_mm / reference_width_px
+        measured_lane_width_mm = row["lane_width_px"] * reference_mm_per_px
+        left_clearance_mm = (image_center_x - row["left_x"]) * local_mm_per_px - (safe_width_mm / 2.0)
+        right_clearance_mm = (row["right_x"] - image_center_x) * local_mm_per_px - (safe_width_mm / 2.0)
+        corridor_error_mm = right_clearance_mm - left_clearance_mm
+        corridor_error_px = row["center_x"] - image_center_x
+        row["mm_per_px"] = local_mm_per_px
+        row["safe_left_x"] = row["center_x"] - (safe_width_mm / local_mm_per_px / 2.0)
+        row["safe_right_x"] = row["center_x"] + (safe_width_mm / local_mm_per_px / 2.0)
+        row["measured_lane_width_mm"] = measured_lane_width_mm
+        row["left_clearance_mm"] = left_clearance_mm
+        row["right_clearance_mm"] = right_clearance_mm
+        row["corridor_error_mm"] = corridor_error_mm
+        lane_width_mm_values.append(measured_lane_width_mm)
+        left_clearances.append(left_clearance_mm)
+        right_clearances.append(right_clearance_mm)
+        center_errors_mm.append(corridor_error_mm)
+        center_errors_px.append(corridor_error_px)
+        safe_width_px_values.append(safe_width_mm / local_mm_per_px)
+
+    measured_lane_width_mm = float(np.average(lane_width_mm_values, weights=weights))
+    measured_lane_width_px = float(np.average(widths_px, weights=weights))
+    left_clearance_mm = float(np.average(left_clearances, weights=weights))
+    right_clearance_mm = float(np.average(right_clearances, weights=weights))
+    corridor_center_error_mm = float(np.average(center_errors_mm, weights=weights))
+    corridor_center_error_px = float(np.average(center_errors_px, weights=weights))
+    safe_width_px = float(np.average(safe_width_px_values, weights=weights))
+
+    min_width = cfg_float(detector_config, "MIN_VALID_LANE_WIDTH_MM", MIN_VALID_LANE_WIDTH_MM)
+    max_width = cfg_float(detector_config, "MAX_VALID_LANE_WIDTH_MM", MAX_VALID_LANE_WIDTH_MM)
+    lane_width_valid = min_width <= measured_lane_width_mm <= max_width
+    reason = "valid"
+    if not ego_debug["ego_component_found"]:
+        reason = "ego_component_missing"
+    elif road_confidence < cfg_float(detector_config, "SAFE_MIN_ROAD_CONFIDENCE", SAFE_MIN_ROAD_CONFIDENCE):
+        reason = "low_confidence"
+    elif len(safe_rows) < cfg_int(detector_config, "SAFE_MIN_VALID_SCANLINES", SAFE_MIN_VALID_SCANLINES):
+        reason = "insufficient_scanlines"
+    elif measured_lane_width_mm < min_width:
+        reason = "too_narrow"
+    elif measured_lane_width_mm > max_width:
+        reason = "too_wide"
+
+    valid = reason == "valid" and lane_width_valid
+    steering = 0.0
+    if valid:
+        deadband = cfg_float(detector_config, "SAFE_ERROR_DEADBAND_MM", SAFE_ERROR_DEADBAND_MM)
+        if abs(corridor_center_error_mm) > deadband:
+            steering = cfg_float(detector_config, "SAFE_STEERING_GAIN", SAFE_STEERING_GAIN) * corridor_center_error_mm
+            steering = clamp(steering, -cfg_float(detector_config, "SAFE_MAX_STEERING_CORRECTION", SAFE_MAX_STEERING_CORRECTION), cfg_float(detector_config, "SAFE_MAX_STEERING_CORRECTION", SAFE_MAX_STEERING_CORRECTION))
+
+    return {
+        "safe_corridor_valid": valid,
+        "visual_helper_active": valid,
+        "safe_corridor_width_mm": safe_width_mm,
+        "safe_corridor_width_px": safe_width_px,
+        "measured_lane_width_mm": measured_lane_width_mm,
+        "measured_lane_width_px": measured_lane_width_px,
+        "lane_width_valid": lane_width_valid,
+        "left_clearance_mm": left_clearance_mm,
+        "right_clearance_mm": right_clearance_mm,
+        "corridor_center_error_mm": corridor_center_error_mm,
+        "corridor_center_error_px": corridor_center_error_px,
+        "visual_steering_correction": steering if valid else 0.0,
+        "safe_scanline_count_valid": len(safe_rows),
+        "safe_scanline_rows": safe_rows,
+        "safe_corridor_reason": reason,
+    }
+
+
+def make_safe_corridor_result(reason, rows, detector_config=None):
+    return {
+        "safe_corridor_valid": False,
+        "visual_helper_active": False,
+        "safe_corridor_width_mm": cfg_float(detector_config, "SAFE_HALLWAY_WIDTH_MM", SAFE_HALLWAY_WIDTH_MM),
+        "safe_corridor_width_px": None,
+        "measured_lane_width_mm": None,
+        "measured_lane_width_px": None,
+        "lane_width_valid": False,
+        "left_clearance_mm": None,
+        "right_clearance_mm": None,
+        "corridor_center_error_mm": None,
+        "corridor_center_error_px": None,
+        "visual_steering_correction": 0.0,
+        "safe_scanline_count_valid": len(rows),
+        "safe_scanline_rows": rows,
+        "safe_corridor_reason": reason,
+    }
 
 
 def estimate_scanline_centers(mask, roi_top, last_center_x=None, frames_since_valid=LAST_CENTER_HOLD_FRAMES + 1, detector_config=None):
@@ -853,6 +1046,7 @@ def draw_visualization(frame, result, confidences, selected_path, smoothed_curve
         draw_candidate_paths(output, confidences, selected_path)
 
     draw_detected_centerline(output, result)
+    draw_safe_corridor(output, result)
     draw_ego_anchor_debug(output, result)
     cv2.line(output, (width // 2, height), (width // 2, int(height * 0.45)), (255, 255, 255), 1)
 
@@ -876,6 +1070,38 @@ def draw_ego_anchor_debug(output, result):
             1,
             cv2.LINE_AA,
         )
+
+
+def draw_safe_corridor(output, result):
+    if not result.safe_scanline_rows:
+        return
+
+    left_points = []
+    right_points = []
+    for row in result.safe_scanline_rows:
+        if "safe_left_x" not in row or "safe_right_x" not in row:
+            continue
+        y = int(row["y"])
+        left_points.append((int(round(row["safe_left_x"])), y))
+        right_points.append((int(round(row["safe_right_x"])), y))
+
+    if len(left_points) < 2 or len(right_points) < 2:
+        return
+
+    polygon = np.array(left_points + list(reversed(right_points)), dtype=np.int32)
+    overlay = output.copy()
+    fill_color = (255, 130, 20) if result.safe_corridor_valid else (120, 80, 60)
+    edge_color = (255, 200, 40) if result.safe_corridor_valid else (140, 120, 100)
+    cv2.fillPoly(overlay, [polygon], fill_color)
+    alpha = 0.42 if result.safe_corridor_valid else 0.22
+    cv2.addWeighted(overlay, alpha, output, 1.0 - alpha, 0, output)
+    cv2.polylines(output, [np.array(left_points, dtype=np.int32)], False, edge_color, 3, cv2.LINE_AA)
+    cv2.polylines(output, [np.array(right_points, dtype=np.int32)], False, edge_color, 3, cv2.LINE_AA)
+
+    center_points = []
+    for left, right in zip(left_points, right_points):
+        center_points.append(((left[0] + right[0]) // 2, left[1]))
+    cv2.polylines(output, [np.array(center_points, dtype=np.int32)], False, (255, 255, 255), 2, cv2.LINE_AA)
 
 
 def draw_candidate_paths(output, confidences, selected_path):
@@ -944,7 +1170,14 @@ def draw_debug_text(output, result, confidences, selected_path, smoothed_curve_e
         f"ego_found: {result.ego_component_found}",
         f"ego_area_pct: {result.ego_component_area_percent:.2f}",
         f"ego_fallback: {result.ego_component_fallback_used}",
-        f"selected_path: {selected_path}",
+        f"safe_corridor_valid: {result.safe_corridor_valid}",
+        f"helper_active: {result.visual_helper_active}",
+        f"lane_width_mm: {safe_fmt(result.measured_lane_width_mm)}",
+        f"L/R clear_mm: {safe_fmt(result.left_clearance_mm)}/{safe_fmt(result.right_clearance_mm)}",
+        f"corridor_err_mm: {safe_fmt(result.corridor_center_error_mm)}",
+        f"steer_helper: {result.visual_steering_correction:.3f}",
+        f"safe_reason: {result.safe_corridor_reason}",
+        f"selected_path(debug): {selected_path}",
         f"straight_confidence: {confidences['straight']:.2f}",
         f"left_confidence: {confidences['left']:.2f}",
         f"right_confidence: {confidences['right']:.2f}",
@@ -964,18 +1197,15 @@ def draw_debug_text(output, result, confidences, selected_path, smoothed_curve_e
         y += line_height
 
 
+def safe_fmt(value):
+    if value is None:
+        return "None"
+    return f"{float(value):.1f}"
+
+
 def build_display_grid(original, result, visualization):
     mask_bgr = cv2.cvtColor(result.mask, cv2.COLOR_GRAY2BGR)
-    road_overlay = original.copy()
-    mask_pixels = result.mask > 0
-    if np.any(mask_pixels):
-        road_overlay[mask_pixels] = cv2.addWeighted(
-            road_overlay[mask_pixels],
-            0.45,
-            np.full_like(road_overlay[mask_pixels], (180, 120, 0)),
-            0.55,
-            0,
-        )
+    road_overlay = build_road_overlay(original, result)
 
     top = np.hstack([label_image(original, "Original RGB"), label_image(mask_bgr, "Road Mask")])
     bottom = np.hstack([label_image(road_overlay, "Road Overlay"), label_image(visualization, "Detected Center Path")])
@@ -1217,6 +1447,22 @@ def get_config_used(settings, config_source=None):
         "EGO_SEED_SEARCH_RADIUS_PX": EGO_SEED_SEARCH_RADIUS_PX,
         "EGO_BOTTOM_BAND_PERCENT": EGO_BOTTOM_BAND_PERCENT,
         "EGO_MIN_COMPONENT_AREA_PERCENT": EGO_MIN_COMPONENT_AREA_PERCENT,
+        "LANE_WIDTH_MM": LANE_WIDTH_MM,
+        "CAR_WIDTH_MM": CAR_WIDTH_MM,
+        "SIDEWALK_MARGIN_MM": SIDEWALK_MARGIN_MM,
+        "LINE_MARGIN_MM": LINE_MARGIN_MM,
+        "SAFE_HALLWAY_WIDTH_MM": SAFE_HALLWAY_WIDTH_MM,
+        "MIN_VALID_LANE_WIDTH_MM": MIN_VALID_LANE_WIDTH_MM,
+        "MAX_VALID_LANE_WIDTH_MM": MAX_VALID_LANE_WIDTH_MM,
+        "SAFE_SCANLINE_COUNT": SAFE_SCANLINE_COUNT,
+        "SAFE_SCANLINE_START_RATIO": SAFE_SCANLINE_START_RATIO,
+        "SAFE_SCANLINE_END_RATIO": SAFE_SCANLINE_END_RATIO,
+        "SAFE_SCANLINE_NEAR_WEIGHT_BIAS": SAFE_SCANLINE_NEAR_WEIGHT_BIAS,
+        "SAFE_MIN_VALID_SCANLINES": SAFE_MIN_VALID_SCANLINES,
+        "SAFE_MIN_ROAD_CONFIDENCE": SAFE_MIN_ROAD_CONFIDENCE,
+        "SAFE_ERROR_DEADBAND_MM": SAFE_ERROR_DEADBAND_MM,
+        "SAFE_STEERING_GAIN": SAFE_STEERING_GAIN,
+        "SAFE_MAX_STEERING_CORRECTION": SAFE_MAX_STEERING_CORRECTION,
         "CENTERLINE_SMOOTHING_ALPHA": CENTERLINE_SMOOTHING_ALPHA,
         "CURVE_DEADBAND_PX": CURVE_DEADBAND_PX,
         "CURVE_STRONG_PX": CURVE_STRONG_PX,
@@ -1234,8 +1480,10 @@ def save_config_used(path, settings, config_source):
         json.dump(get_config_used(settings, config_source), file, indent=2)
 
 
-def build_road_overlay(frame, mask):
+def build_road_overlay(frame, mask_or_result):
     overlay = frame.copy()
+    result = mask_or_result if hasattr(mask_or_result, "mask") else None
+    mask = result.mask if result is not None else mask_or_result
     mask_pixels = mask > 0
     if np.any(mask_pixels):
         overlay[mask_pixels] = cv2.addWeighted(
@@ -1245,6 +1493,8 @@ def build_road_overlay(frame, mask):
             0.55,
             0,
         )
+    if result is not None:
+        draw_safe_corridor(overlay, result)
     return overlay
 
 
@@ -1290,6 +1540,20 @@ def build_telemetry_row(frame_index, time_sec, result, confidences, selected_pat
         "ego_component_area_pixels": result.ego_component_area_pixels,
         "ego_component_area_percent": f"{result.ego_component_area_percent:.4f}",
         "ego_component_fallback_used": result.ego_component_fallback_used,
+        "safe_corridor_valid": result.safe_corridor_valid,
+        "visual_helper_active": result.visual_helper_active,
+        "safe_corridor_width_mm": f"{result.safe_corridor_width_mm:.3f}",
+        "safe_corridor_width_px": safe_number(result.safe_corridor_width_px),
+        "measured_lane_width_mm": safe_number(result.measured_lane_width_mm),
+        "measured_lane_width_px": safe_number(result.measured_lane_width_px),
+        "lane_width_valid": result.lane_width_valid,
+        "left_clearance_mm": safe_number(result.left_clearance_mm),
+        "right_clearance_mm": safe_number(result.right_clearance_mm),
+        "corridor_center_error_mm": safe_number(result.corridor_center_error_mm),
+        "corridor_center_error_px": safe_number(result.corridor_center_error_px),
+        "visual_steering_correction": f"{result.visual_steering_correction:.5f}",
+        "safe_scanline_count_valid": result.safe_scanline_count_valid,
+        "safe_corridor_reason": result.safe_corridor_reason,
         "selected_path": selected_path,
         "straight_confidence": f"{confidences['straight']:.4f}",
         "left_confidence": f"{confidences['left']:.4f}",
@@ -1332,6 +1596,8 @@ def detect_frame_events(frame_index, time_sec, result, selected_path, turn_hint,
         "tracked_center_valid": result.tracked_center_valid,
         "low_confidence": result.road_confidence < 0.60,
         "rejected_scanlines_high": result.rejected_scanlines >= 5,
+        "safe_corridor_valid": result.safe_corridor_valid,
+        "safe_corridor_reason": result.safe_corridor_reason,
     }
 
     if previous_state is None:
@@ -1339,6 +1605,8 @@ def detect_frame_events(frame_index, time_sec, result, selected_path, turn_hint,
             events.append(("low_confidence_started", "", f"{result.road_confidence:.3f}", "Road confidence dropped below 0.60."))
         if current_state["rejected_scanlines_high"]:
             events.append(("rejected_scanlines_high_started", "", result.rejected_scanlines, "Five or more scanlines were rejected."))
+        if not current_state["safe_corridor_valid"]:
+            events.append(("safe_corridor_invalid_started", "", result.safe_corridor_reason, "Safe corridor helper is inactive."))
         return events, current_state
 
     if not previous_state["low_confidence"] and current_state["low_confidence"]:
@@ -1349,6 +1617,15 @@ def detect_frame_events(frame_index, time_sec, result, selected_path, turn_hint,
         events.append(("rejected_scanlines_high_started", "", result.rejected_scanlines, "Five or more scanlines were rejected."))
     if previous_state["rejected_scanlines_high"] and not current_state["rejected_scanlines_high"]:
         events.append(("rejected_scanlines_high_ended", "", result.rejected_scanlines, "Rejected scanlines dropped below five."))
+    if previous_state["safe_corridor_valid"] and not current_state["safe_corridor_valid"]:
+        events.append(("safe_corridor_invalid_started", "valid", result.safe_corridor_reason, "Safe corridor changed from valid to inactive."))
+    if not previous_state["safe_corridor_valid"] and current_state["safe_corridor_valid"]:
+        events.append(("safe_corridor_invalid_ended", previous_state["safe_corridor_reason"], "valid", "Safe corridor helper became active."))
+    if (
+        not current_state["safe_corridor_valid"]
+        and previous_state["safe_corridor_reason"] != current_state["safe_corridor_reason"]
+    ):
+        events.append(("safe_corridor_reason_changed", previous_state["safe_corridor_reason"], result.safe_corridor_reason, "Safe corridor inactive reason changed."))
 
     if previous_state["road_detected"] and not result.road_detected:
         events.append(("road_lost", True, False, "Road detection changed from valid to lost."))
@@ -1390,6 +1667,8 @@ def failure_reason_from_events(result, events):
         return "curve_jump"
     if "rejected_scanlines_high_started" in event_types:
         return "rejected_scanlines"
+    if "safe_corridor_invalid_started" in event_types:
+        return f"safe_corridor_{result.safe_corridor_reason}"
     return None
 
 
@@ -1414,6 +1693,7 @@ def save_periodic_ai_samples(frame, result, overlay, debug_frame, folder, frame_
     cv2.imwrite(str(folder / f"frame_{frame_index:06d}_ego_mask.jpg"), result.mask)
     cv2.imwrite(str(folder / f"frame_{frame_index:06d}_overlay.jpg"), overlay)
     cv2.imwrite(str(folder / f"frame_{frame_index:06d}_debug.jpg"), debug_frame)
+    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_safe_corridor_debug.jpg"), debug_frame)
     return next_sample_time + interval_sec
 
 
@@ -1460,6 +1740,18 @@ def average(values):
     return sum(clean_values) / len(clean_values)
 
 
+def stddev(values):
+    clean_values = [float(value) for value in values if value not in (None, "")]
+    if len(clean_values) < 2:
+        return 0.0
+    mean = sum(clean_values) / len(clean_values)
+    return (sum((value - mean) ** 2 for value in clean_values) / len(clean_values)) ** 0.5
+
+
+def numeric_values(rows, key):
+    return [float(row[key]) for row in rows if row.get(key) not in (None, "")]
+
+
 def most_common_text(values, default="unknown"):
     if not values:
         return default
@@ -1496,6 +1788,10 @@ def write_human_summary(path, args, processed_frames, duration_sec, stats, recom
         f"Max absolute road_center_error_px: {stats['max_abs_road_center_error_px']:.2f}",
         f"Average absolute curve_error_px: {stats['average_abs_curve_error_px']:.2f}",
         f"Most common turn_hint: {stats['most_common_turn_hint']}",
+        f"Safe corridor valid percent: {stats['safe_corridor_valid_percent']:.1f}%",
+        f"Visual helper active percent: {stats['visual_helper_active_percent']:.1f}%",
+        f"Average measured lane width: {stats['average_measured_lane_width_mm']:.2f} mm",
+        f"Average absolute corridor center error: {stats['average_abs_corridor_center_error_mm']:.2f} mm",
         "",
         "Major problems found:",
     ]
@@ -1505,6 +1801,9 @@ def write_human_summary(path, args, processed_frames, duration_sec, stats, recom
         lines.append("- None detected from telemetry thresholds.")
     lines.extend(["", "Simple recommendation:"])
     lines.extend([f"- {recommendation}" for recommendation in recommendations])
+    if stats["inactive_reason_counts"]:
+        lines.extend(["", "Safe corridor inactive reasons:"])
+        lines.extend([f"- {reason}: {count}" for reason, count in stats["inactive_reason_counts"].items()])
 
     with open(path, "w", encoding="utf-8") as file:
         file.write("\n".join(lines) + "\n")
@@ -1536,6 +1835,15 @@ def write_ai_summary_json(path, args, processed_frames, total_frames, duration_s
         "tracked_center_invalid_count": stats["tracked_center_invalid_count"],
         "turn_hint_counts": stats["turn_hint_counts"],
         "selected_path_counts": stats["selected_path_counts"],
+        "safe_corridor_valid_percent": stats["safe_corridor_valid_percent"],
+        "visual_helper_active_percent": stats["visual_helper_active_percent"],
+        "average_measured_lane_width_mm": stats["average_measured_lane_width_mm"],
+        "lane_width_std_mm": stats["lane_width_std_mm"],
+        "average_left_clearance_mm": stats["average_left_clearance_mm"],
+        "average_right_clearance_mm": stats["average_right_clearance_mm"],
+        "average_abs_corridor_center_error_mm": stats["average_abs_corridor_center_error_mm"],
+        "max_abs_corridor_center_error_mm": stats["max_abs_corridor_center_error_mm"],
+        "inactive_reason_counts": stats["inactive_reason_counts"],
         "config_used": get_config_used(settings, config_source),
         "known_problem_intervals": problem_intervals,
     }
@@ -1565,14 +1873,14 @@ def write_run_notes(path, args, folders):
         "- events CSV: only important changes such as road loss, low confidence, jumps, and path changes.",
         "- summary AI JSON: structured run summary and grouped problem intervals.",
         "- config used JSON: exact HSV/ROI/math thresholds used for the run.",
-        "- frame_samples: periodic original/raw_mask/ego_mask/overlay/debug images.",
+        "- frame_samples: periodic original/raw_mask/ego_mask/overlay/debug/safe_corridor_debug images.",
         "- failure_frames: suspicious debug frames, capped by command-line settings.",
         "",
         "Known limitations:",
         "- No machine learning, no training, no YOLO, no PyTorch, no TensorFlow.",
         "- RGB only; no ROS2 and no RealSense depth processing yet.",
         "- Lighting changes and road color changes may require HSV retuning.",
-        "- Candidate paths are simple visual hints; the detected centerline is the main output.",
+        "- Candidate paths are secondary debug hints; the blue safe corridor is the main local visual helper.",
         "",
         "Files to upload to ChatGPT for analysis:",
         "- test_video_telemetry.csv",
@@ -1595,6 +1903,16 @@ def collect_stats(rows, event_counts, processed_frames):
     rejected_scanline_problem_count = sum(1 for row in rows if int(row["rejected_scanlines"]) >= 5)
     turn_hint_counts = Counter(row["turn_hint"] for row in rows)
     selected_path_counts = Counter(row["selected_path"] for row in rows)
+    safe_valid_count = sum(1 for row in rows if row["safe_corridor_valid"] is True)
+    helper_active_count = sum(1 for row in rows if row["visual_helper_active"] is True)
+    lane_widths_mm = numeric_values(rows, "measured_lane_width_mm")
+    left_clearances_mm = numeric_values(rows, "left_clearance_mm")
+    right_clearances_mm = numeric_values(rows, "right_clearance_mm")
+    corridor_errors_mm = numeric_values(rows, "corridor_center_error_mm")
+    steering_corrections = numeric_values(rows, "visual_steering_correction")
+    inactive_reason_counts = Counter(
+        row["safe_corridor_reason"] for row in rows if row["safe_corridor_reason"] != "valid"
+    )
 
     abs_center_errors = [abs(float(value)) for value in center_errors]
     abs_curve_errors = [abs(float(value)) for value in curve_errors]
@@ -1611,6 +1929,9 @@ def collect_stats(rows, event_counts, processed_frames):
         major_problems.append(f"{event_counts['curve_jump']} curve-jump events")
     if rejected_scanline_problem_count > 0:
         major_problems.append(f"{rejected_scanline_problem_count} high rejected-scanline frames")
+    if inactive_reason_counts:
+        reason, count = inactive_reason_counts.most_common(1)[0]
+        major_problems.append(f"{count} safe-corridor inactive frames, most often {reason}")
 
     return {
         "average_road_confidence": average(confidences),
@@ -1629,6 +1950,16 @@ def collect_stats(rows, event_counts, processed_frames):
         "turn_hint_counts": dict(turn_hint_counts),
         "selected_path_counts": dict(selected_path_counts),
         "most_common_turn_hint": most_common_text([row["turn_hint"] for row in rows]),
+        "safe_corridor_valid_percent": safe_valid_count / max(1, processed_frames) * 100.0,
+        "visual_helper_active_percent": helper_active_count / max(1, processed_frames) * 100.0,
+        "average_measured_lane_width_mm": average(lane_widths_mm),
+        "lane_width_std_mm": stddev(lane_widths_mm),
+        "average_left_clearance_mm": average(left_clearances_mm),
+        "average_right_clearance_mm": average(right_clearances_mm),
+        "average_abs_corridor_center_error_mm": average([abs(value) for value in corridor_errors_mm]),
+        "max_abs_corridor_center_error_mm": max([abs(value) for value in corridor_errors_mm]) if corridor_errors_mm else 0.0,
+        "average_abs_visual_steering_correction": average([abs(value) for value in steering_corrections]),
+        "inactive_reason_counts": dict(inactive_reason_counts),
         "major_problems": major_problems,
     }
 
@@ -1678,7 +2009,7 @@ def process_video_tuning_mode(args):
     playback_speed = max(0.1, float(args.playback_speed))
     paused = False
     show_mask_window = False
-    show_candidates = True
+    show_candidates = False
     use_ego_connected_mask = USE_EGO_CONNECTED_MASK
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
@@ -1686,7 +2017,7 @@ def process_video_tuning_mode(args):
 
     print("Manual video tuning controls:")
     print("q/ESC quit | p/SPACE pause | s save config | l load config-output | r reset")
-    print("e toggle ego-connected mask | m mask window | c candidate paths")
+    print("e toggle ego-connected mask | m mask window | c secondary candidate paths")
     print("g good sample | f difficult sample | d debug snapshot | n/right next | b/left back")
 
     try:
@@ -1725,7 +2056,7 @@ def process_video_tuning_mode(args):
                 turn_hint,
                 show_candidates,
             )
-            overlay = build_road_overlay(frame, result.mask)
+            overlay = build_road_overlay(frame, result)
             display = build_display_grid(frame, result, debug_frame)
             cv2.putText(
                 display,
@@ -1900,6 +2231,20 @@ def process_video_source(args):
         "ego_component_area_pixels",
         "ego_component_area_percent",
         "ego_component_fallback_used",
+        "safe_corridor_valid",
+        "visual_helper_active",
+        "safe_corridor_width_mm",
+        "safe_corridor_width_px",
+        "measured_lane_width_mm",
+        "measured_lane_width_px",
+        "lane_width_valid",
+        "left_clearance_mm",
+        "right_clearance_mm",
+        "corridor_center_error_mm",
+        "corridor_center_error_px",
+        "visual_steering_correction",
+        "safe_scanline_count_valid",
+        "safe_corridor_reason",
         "selected_path",
         "straight_confidence",
         "left_confidence",
@@ -1917,7 +2262,7 @@ def process_video_source(args):
 
     tracker = PathConfidenceTracker()
     show_mask_window = False
-    show_candidates = True
+    show_candidates = False
     paused = False
     stopped_early = False
     last_center_x = None
@@ -1994,7 +2339,7 @@ def process_video_source(args):
                     turn_hint,
                     show_candidates,
                 )
-                overlay = build_road_overlay(frame, result.mask)
+                overlay = build_road_overlay(frame, result)
                 writer.write(debug_frame)
                 last_debug_frame = debug_frame.copy()
 
@@ -2092,7 +2437,7 @@ def process_video_source(args):
                         print("Paused.")
                     elif action == "toggle_candidates":
                         show_candidates = not show_candidates
-                        print("Candidate paths on." if show_candidates else "Candidate paths off.")
+                        print("Secondary candidate paths on." if show_candidates else "Secondary candidate paths off.")
 
                 frame_index += 1
         finally:
@@ -2164,7 +2509,7 @@ def main():
 
     tracker = PathConfidenceTracker()
     show_mask_window = False
-    show_candidates = True
+    show_candidates = False
     paused = False
     last_frame = None
     last_center_x = None
@@ -2225,7 +2570,7 @@ def main():
                 print("Paused." if paused else "Unpaused.")
             elif action == "toggle_candidates":
                 show_candidates = not show_candidates
-                print("Candidate paths on." if show_candidates else "Candidate paths off.")
+                print("Secondary candidate paths on." if show_candidates else "Secondary candidate paths off.")
     finally:
         source.release()
         cv2.destroyAllWindows()
