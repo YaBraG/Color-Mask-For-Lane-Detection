@@ -6,6 +6,35 @@ Files changed:
 
 - `main.py`
 - `tune.py`
+- `README.md`
+- `CHANGELOG.md`
+
+Summary:
+
+- Removed active video-report and AI-output generation from `main.py`.
+- Removed runtime writing of annotated MP4s, telemetry CSVs, events CSVs, summaries, failure frames, frame samples, key frames, and latest-run files.
+- Simplified the runtime CLI to local testing inputs only: `--source`, `--video`, `--image`, `--camera-index`, `--config`, `--display/--no-display`, `--show-debug`, and `--show-inactive-helper`.
+- Kept `configs/csi_front_config.json` as the default config and `configs/realsense_config.json` as the alternate RealSense RGB config.
+- Kept `tune.py` as the only manual tuning program; it saves configs and optional single debug snapshots only.
+- Removed old candidate path/confidence visuals from active behavior and kept blue strictly for the active safe hallway.
+- Kept inactive helper visuals hidden by default and available only through `--show-inactive-helper`.
+- Kept `build_helper_output(...)` as the future ROS2 message payload shape.
+
+Known limitations:
+
+- This is still a local Python/OpenCV runtime, not a ROS2 subscriber/publisher yet.
+- Display and tuning use OpenCV desktop windows.
+
+Follow-up work:
+
+- Create a ROS2 node that subscribes to camera images and publishes the helper output dictionary.
+
+## 2026-05-23
+
+Files changed:
+
+- `main.py`
+- `tune.py`
 - `configs/csi_front_config.json`
 - `configs/realsense_config.json`
 - `README.md`

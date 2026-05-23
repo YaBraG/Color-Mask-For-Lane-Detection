@@ -1,11 +1,7 @@
 import argparse
-import csv
 import json
-import os
-import shutil
 import sys
 import time
-from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -361,58 +357,30 @@ def compute_turn_hint(curve_error_px, detector_config=None):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RGB-only QCar2 drift-helper detector.")
-    parser.add_argument("--source", choices=["image", "webcam", "realsense", "video"], required=True)
+    parser.add_argument("--source", choices=["image", "webcam", "realsense", "video"], default="video")
     parser.add_argument("--image", help="Path to a static image for --source image.")
     parser.add_argument("--video", help="Path to a video file for --source video.")
     parser.add_argument("--camera-index", type=int, default=0, help="OpenCV webcam index for --source webcam.")
-    parser.add_argument("--output-dir", default="outputs", help="Folder where video-mode outputs are written.")
-    parser.add_argument("--no-display", action="store_true", help="Process video without opening OpenCV windows.")
+    parser.add_argument("--display", action=argparse.BooleanOptionalAction, default=True, help="Show OpenCV display windows.")
+    parser.add_argument("--show-debug", action="store_true", help="Draw extra scanline/anchor debugging.")
     parser.add_argument(
         "--show-inactive-helper",
         action="store_true",
         help="Draw faint inactive helper geometry for debugging. Hidden by default.",
     )
     parser.add_argument(
-        "--use-default-config",
-        action="store_true",
-        help="Use built-in defaults instead of loading the camera JSON.",
-    )
-    parser.add_argument(
         "--config",
         default=CONFIG_FILE,
         help="Camera config JSON to load. Defaults to configs/csi_front_config.json.",
-    )
-    parser.add_argument(
-        "--clean-output",
-        action="store_true",
-        help="Delete only the new timestamped run folder before writing if it already exists.",
-    )
-    parser.add_argument(
-        "--save-failure-frames",
-        action="store_true",
-        help="Save debug images for suspicious video frames, up to --max-failure-frames.",
-    )
-    parser.add_argument(
-        "--max-failure-frames",
-        type=int,
-        default=100,
-        help="Maximum suspicious-frame debug images to save when --save-failure-frames is used.",
-    )
-    parser.add_argument(
-        "--ai-sample-interval-sec",
-        type=float,
-        default=2.0,
-        help="Seconds between periodic AI frame samples in video mode.",
     )
     return parser.parse_args()
 
 
 def print_startup(args):
-    print("QCar2 RGB Road Detector")
+    print("QCar2 RGB Drift Helper")
     print("-----------------------")
     print(f"Source: {args.source}")
-    print("Keys: q/ESC quit | s save HSV | l load HSV | r reset HSV | m mask | p pause")
-    print("Tune HSV until road is white in the mask and non-road is black.")
+    print("Keys: q/ESC quit | p pause | d save debug snapshot")
     print()
 
 
@@ -486,12 +454,6 @@ def set_trackbars(settings):
             pass
 
 
-def save_settings(settings):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as file:
-        json.dump(settings, file, indent=2)
-    print(f"Saved HSV settings to {CONFIG_FILE}")
-
-
 def config_values_from_payload(payload):
     """Extract runtime detector values from either flat or metadata JSON."""
     values = payload.get("settings", payload.get("config", payload))
@@ -511,19 +473,6 @@ def config_values_from_payload(payload):
     for name in TRACKBAR_RANGES:
         if name in values:
             settings[name] = int(values[name])
-    return settings
-
-
-def load_settings(config_path=CONFIG_FILE):
-    if not config_path or not os.path.exists(config_path):
-        print(f"No config found at {config_path}. Using built-in defaults.")
-        return None
-
-    with open(config_path, "r", encoding="utf-8") as file:
-        loaded = json.load(file)
-
-    settings = config_values_from_payload(loaded)
-    print(f"Loaded detector settings from {config_path}")
     return settings
 
 
@@ -1517,7 +1466,7 @@ def smooth_centerline_points(raw_points, detector_config=None):
     return smoothed_points
 
 
-def draw_visualization(frame, result, turn_hint, settings=None, show_inactive_helper=False):
+def draw_visualization(frame, result, turn_hint, settings=None, show_inactive_helper=False, show_debug=False):
     output = frame.copy()
     height, width = output.shape[:2]
 
@@ -1526,16 +1475,18 @@ def draw_visualization(frame, result, turn_hint, settings=None, show_inactive_he
     road_alpha = cfg_float(settings, "ROAD_OVERLAY_ALPHA", DEFAULT_SETTINGS["ROAD_OVERLAY_ALPHA"])
     output = np.where(result.mask[:, :, None] > 0, cv2.addWeighted(output, 1.0 - road_alpha, road_color, road_alpha, 0), output)
 
-    for left_x, y in result.boundary_points:
-        cv2.circle(output, (left_x, y), 4, (0, 255, 255), -1)
+    if show_debug:
+        for left_x, y in result.boundary_points:
+            cv2.circle(output, (left_x, y), 4, (0, 255, 255), -1)
 
     draw_detected_centerline(output, result, show_inactive_helper)
     draw_safe_corridor(output, result, settings, show_inactive_helper)
     draw_yellow_boundary(output, result)
-    draw_ego_anchor_debug(output, result)
+    if show_debug:
+        draw_ego_anchor_debug(output, result)
     cv2.line(output, (width // 2, height), (width // 2, int(height * 0.45)), (255, 255, 255), 1)
 
-    draw_debug_text(output, result, turn_hint)
+    draw_debug_text(output, result, turn_hint, show_debug)
     return output
 
 
@@ -1657,41 +1608,30 @@ def draw_detected_centerline(output, result, show_inactive_helper=False):
         cv2.circle(output, (x, y), 5, (0, 255, 0), -1)
 
 
-def draw_debug_text(output, result, turn_hint):
-    error = result.road_center_error_px
-    error_text = "None" if error is None else f"{error:.1f}"
-    curve_text = "None" if result.curve_error_px is None else f"{result.curve_error_px:.1f}"
-    near_text = "None" if result.near_center_x is None else str(result.near_center_x)
-    far_text = "None" if result.far_center_x is None else str(result.far_center_x)
+def draw_debug_text(output, result, turn_hint, show_debug=False):
     lines = [
-        f"road_detected: {result.road_detected}",
+        f"helper: {'ON' if result.visual_helper_active else 'OFF'}",
+        f"reason: {result.safe_corridor_reason}",
         f"road_confidence: {result.road_confidence:.2f}",
-        f"road_center_error_px: {error_text}",
-        f"curve_error_px: {curve_text}",
+        f"corridor_error_mm: {safe_fmt(result.corridor_center_error_mm)}",
+        f"steering_correction: {result.visual_steering_correction:.3f}",
         f"turn_hint: {turn_hint}",
-        f"near_center_x: {near_text}",
-        f"far_center_x: {far_text}",
-        f"tracked_center_valid: {result.tracked_center_valid}",
-        f"rejected_scanlines: {result.rejected_scanlines}",
-        f"ego_found: {result.ego_component_found}",
-        f"ego_area_pct: {result.ego_component_area_percent:.2f}",
-        f"ego_fallback: {result.ego_component_fallback_used}",
-        f"safe_corridor_valid: {result.safe_corridor_valid}",
-        f"helper_active: {result.visual_helper_active}",
-        f"ego_ref_x: {result.ego_reference_x:.1f}",
-        f"cam_offset_px: {result.camera_center_offset_px:.1f}",
-        f"lane_center_x: {safe_fmt(result.lane_center_x)}",
-        f"lane_width_mm: {safe_fmt(result.measured_lane_width_mm)}",
-        f"L/R clear_mm: {safe_fmt(result.left_clearance_mm)}/{safe_fmt(result.right_clearance_mm)}",
-        f"corridor_err_mm: {safe_fmt(result.corridor_center_error_mm)}",
-        f"steer_helper: {result.visual_steering_correction:.3f}",
-        f"safe_reason: {result.safe_corridor_reason}",
-        f"yellow_lock: {result.yellow_boundary_enforced}",
-        f"lane_side: {result.selected_lane_side}",
-        f"yellow_cross_px: {result.yellow_crossing_pixels}",
+        f"yellow_detected: {result.yellow_boundary_detected}",
         f"right_lane_lock: {result.right_lane_lock_active}",
-        f"right_lane_reason: {result.right_lane_lock_reason}",
     ]
+    if show_debug:
+        lines.extend(
+            [
+                f"safe_corridor_valid: {result.safe_corridor_valid}",
+                f"curve_error_px: {safe_fmt(result.curve_error_px)}",
+                f"L/R clear_mm: {safe_fmt(result.left_clearance_mm)}/{safe_fmt(result.right_clearance_mm)}",
+                f"ego_found: {result.ego_component_found}",
+                f"ego_area_pct: {result.ego_component_area_percent:.2f}",
+                f"rejected_scanlines: {result.rejected_scanlines}",
+                f"scanlines_valid: {result.valid_scanline_count}",
+                f"right_lane_segment: {result.right_lane_segment_found}",
+            ]
+        )
 
     x = 12
     y = 28
@@ -1733,62 +1673,9 @@ def label_image(image, label):
 def handle_key(key, settings):
     if key in (ord("q"), 27):
         return "quit"
-    if key == ord("s"):
-        save_settings(settings)
-    elif key == ord("l"):
-        loaded = load_settings()
-        if loaded:
-            set_trackbars(loaded)
-    elif key == ord("r"):
-        set_trackbars(DEFAULT_SETTINGS)
-        print("Reset HSV settings to defaults.")
-    elif key == ord("m"):
-        return "toggle_mask"
-    elif key == ord("p"):
+    if key == ord("p"):
         return "toggle_pause"
     return None
-
-
-def get_output_base_name(video_path):
-    return Path(video_path).stem
-
-
-def create_output_folders(output_dir, base_name, clean_output=False):
-    # Video output is split in two on purpose:
-    # human_output is for a person to watch, while output_for_AI is organized
-    # as structured CSV/JSON/text/images for later ChatGPT analysis.
-    output_root = Path(output_dir)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    root = output_root / f"{base_name}_{timestamp}"
-    if root.exists() and clean_output:
-        shutil.rmtree(root)
-    elif root.exists():
-        suffix = 1
-        while (output_root / f"{base_name}_{timestamp}_{suffix:02d}").exists():
-            suffix += 1
-        root = output_root / f"{base_name}_{timestamp}_{suffix:02d}"
-    human_dir = root / "human_output"
-    ai_dir = root / "output_for_AI"
-    key_frames_dir = human_dir / "key_frames"
-    frame_samples_dir = ai_dir / "frame_samples"
-    failure_frames_dir = ai_dir / "failure_frames"
-
-    for folder in (human_dir, ai_dir, key_frames_dir, frame_samples_dir, failure_frames_dir):
-        folder.mkdir(parents=True, exist_ok=True)
-
-    output_root.mkdir(parents=True, exist_ok=True)
-    latest_run_path = output_root / "latest_run.txt"
-    latest_run_path.write_text(str(root.resolve()) + "\n", encoding="utf-8")
-
-    return {
-        "root": root,
-        "latest_run": latest_run_path,
-        "human": human_dir,
-        "ai": ai_dir,
-        "key_frames": key_frames_dir,
-        "frame_samples": frame_samples_dir,
-        "failure_frames": failure_frames_dir,
-    }
 
 
 def load_settings_file(path):
@@ -1798,9 +1685,6 @@ def load_settings_file(path):
 
 
 def load_video_settings(args):
-    if args.use_default_config:
-        return DEFAULT_SETTINGS.copy(), "DEFAULT_SETTINGS"
-
     config_path = Path(args.config or CONFIG_FILE)
     if config_path.exists():
         source = CONFIG_FILE if str(config_path) == CONFIG_FILE else str(config_path)
@@ -1808,35 +1692,6 @@ def load_video_settings(args):
         return load_settings_file(config_path), source
 
     raise RuntimeError(f"Could not find config file: {config_path}")
-
-
-def load_manual_tuning_settings(args):
-    # Manual tuning is meant to find a fresh baseline. It starts from the code
-    # defaults unless the user deliberately points at a previous config file.
-    if args.config is None:
-        return DEFAULT_SETTINGS.copy(), "DEFAULT_SETTINGS"
-
-    config_path = Path(args.config)
-    if not config_path.exists():
-        raise RuntimeError(f"Could not find config file: {config_path}")
-
-    return load_settings_file(config_path), str(config_path)
-
-
-def create_manual_tuning_folders():
-    # Good and difficult samples become visual evidence for future camera
-    # retuning, so they live in stable folders instead of per-analysis runs.
-    root = Path("outputs") / "manual_tuning"
-    folders = {
-        "root": root,
-        "good_samples": root / "good_samples",
-        "difficult_samples": root / "difficult_samples",
-        "debug_snapshots": root / "debug_snapshots",
-    }
-    Path("configs").mkdir(parents=True, exist_ok=True)
-    for folder in folders.values():
-        folder.mkdir(parents=True, exist_ok=True)
-    return folders
 
 
 def save_manual_tuning_config(path, settings, source_video, frame_index):
@@ -1866,51 +1721,6 @@ def save_manual_tuning_config(path, settings, source_video, frame_index):
     print(f"Saved manual tuning config to {path}")
 
 
-def save_manual_tuning_session(path, source_video, last_saved_frame_index, config_output_path, session, settings):
-    # The session file records which frames were useful during manual tuning.
-    # That makes later CSI/RealSense retuning easier to repeat.
-    payload = {
-        "source_video": str(source_video),
-        "last_saved_frame_index": last_saved_frame_index,
-        "config_output_path": str(config_output_path),
-        "good_sample_frames": session["good_sample_frames"],
-        "difficult_sample_frames": session["difficult_sample_frames"],
-        "debug_snapshot_frames": session["debug_snapshot_frames"],
-        "final_config": {name: value for name, value in settings.items() if is_json_scalar(value)},
-        "notes_for_retuning": "Use these saved frames when checking future CSI or RealSense camera adjustments.",
-    }
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(payload, file, indent=2)
-
-
-def save_tuning_sample(kind, folders, frame_index, frame, result, overlay, debug_frame):
-    # Good samples show frames where the current mask works well. Difficult
-    # samples show where manual tuning still needs attention.
-    if kind == "good":
-        folder = folders["good_samples"]
-        frame_list_name = "good_sample_frames"
-        save_overlay = False
-    elif kind == "difficult":
-        folder = folders["difficult_samples"]
-        frame_list_name = "difficult_sample_frames"
-        save_overlay = False
-    else:
-        folder = folders["debug_snapshots"]
-        frame_list_name = "debug_snapshot_frames"
-        save_overlay = True
-
-    prefix = folder / f"frame_{frame_index:06d}"
-    cv2.imwrite(str(prefix) + "_original.jpg", frame)
-    cv2.imwrite(str(prefix) + "_mask.jpg", result.mask)
-    if save_overlay:
-        cv2.imwrite(str(prefix) + "_overlay.jpg", overlay)
-    cv2.imwrite(str(prefix) + "_debug.jpg", debug_frame)
-    print(f"Saved {kind} tuning sample for frame {frame_index}")
-    return frame_list_name
-
-
 def seek_video_frame(cap, frame_index, total_frames):
     # OpenCV can jump directly by frame index for normal MP4 files. We clamp
     # the requested frame so stepping cannot seek before the start or past end.
@@ -1926,19 +1736,6 @@ def update_video_control_trackbar(frame_index, total_frames):
     if total_frames <= 0:
         return
     cv2.setTrackbarPos("Frame", WINDOW_VIDEO_CONTROL, int(frame_index))
-
-
-def get_config_used(settings, config_source=None):
-    config = {"config_source": config_source}
-    config.update({key: value for key, value in settings.items() if is_json_scalar(value)})
-    return config
-
-
-def save_config_used(path, settings, config_source):
-    # This JSON makes a run reproducible because it records the exact HSV,
-    # ROI, scanline, smoothing, and deadband values used for the video.
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(get_config_used(settings, config_source), file, indent=2)
 
 
 def build_road_overlay(frame, mask_or_result, settings=None, show_inactive_helper=False):
@@ -1959,12 +1756,6 @@ def build_road_overlay(frame, mask_or_result, settings=None, show_inactive_helpe
     if result is not None:
         draw_safe_corridor(overlay, result, settings, show_inactive_helper)
     return overlay
-
-
-def safe_number(value, default=""):
-    if value is None:
-        return default
-    return value
 
 
 def is_json_scalar(value):
@@ -1991,254 +1782,7 @@ def build_helper_output(result, config=None, timestamp=None, turn_hint=None):
         "safe_corridor_reason": result.safe_corridor_reason,
         "yellow_boundary_detected": bool(result.yellow_boundary_detected),
         "right_lane_lock_active": bool(result.right_lane_lock_active),
-        "camera_type": camera_type,
     }
-
-
-def build_telemetry_row(frame_index, time_sec, result, turn_hint, processing_fps, camera_type="unknown", settings=None):
-    height, width = result.mask.shape[:2]
-    mask_area_pixels = int(cv2.countNonZero(result.mask))
-    mask_area_percent = mask_area_pixels / max(1, width * height) * 100.0
-
-    # road_center_error_px means road center minus camera/image center.
-    # Negative values mean the road is left of the camera; positive values mean it is right.
-    # curve_error_px means far road center minus near road center.
-    # Negative values hint left curvature; positive values hint right curvature.
-    # rejected_scanlines counts scan rows skipped because no usable road segment was found
-    # or because the center jumped too far to trust.
-    return {
-        "frame_index": frame_index,
-        "time_sec": f"{time_sec:.3f}",
-        "road_detected": result.road_detected,
-        "road_confidence": f"{result.road_confidence:.4f}",
-        "road_center_error_px": safe_number(result.road_center_error_px),
-        "curve_error_px": safe_number(result.curve_error_px),
-        "turn_hint": turn_hint,
-        "near_center_x": safe_number(result.near_center_x),
-        "far_center_x": safe_number(result.far_center_x),
-        "tracked_center_valid": result.tracked_center_valid,
-        "rejected_scanlines": result.rejected_scanlines,
-        "valid_scanline_count": result.valid_scanline_count,
-        "detection_quality": f"{result.detection_quality:.4f}",
-        "seed_center_x": f"{result.seed_center_x:.2f}",
-        "first_anchor_x": safe_number(result.first_anchor_x),
-        "first_anchor_distance_px": safe_number(result.first_anchor_distance_px),
-        "ego_component_found": result.ego_component_found,
-        "ego_seed_x": result.ego_seed_x,
-        "ego_seed_y": result.ego_seed_y,
-        "ego_anchor_x": safe_number(result.ego_anchor_x),
-        "ego_anchor_y": safe_number(result.ego_anchor_y),
-        "ego_component_area_pixels": result.ego_component_area_pixels,
-        "ego_component_area_percent": f"{result.ego_component_area_percent:.4f}",
-        "ego_component_fallback_used": result.ego_component_fallback_used,
-        "safe_corridor_valid": result.safe_corridor_valid,
-        "visual_helper_active": result.visual_helper_active,
-        "safe_corridor_width_mm": f"{result.safe_corridor_width_mm:.3f}",
-        "safe_corridor_width_px": safe_number(result.safe_corridor_width_px),
-        "measured_lane_width_mm": safe_number(result.measured_lane_width_mm),
-        "measured_lane_width_px": safe_number(result.measured_lane_width_px),
-        "lane_width_valid": result.lane_width_valid,
-        "left_clearance_mm": safe_number(result.left_clearance_mm),
-        "right_clearance_mm": safe_number(result.right_clearance_mm),
-        "corridor_center_error_mm": safe_number(result.corridor_center_error_mm),
-        "corridor_center_error_px": safe_number(result.corridor_center_error_px),
-        "visual_steering_correction": f"{result.visual_steering_correction:.5f}",
-        "safe_scanline_count_valid": result.safe_scanline_count_valid,
-        "safe_corridor_reason": result.safe_corridor_reason,
-        "yellow_boundary_detected": result.yellow_boundary_detected,
-        "yellow_boundary_pixel_count": result.yellow_boundary_pixel_count,
-        "yellow_boundary_enforced": result.yellow_boundary_enforced,
-        "selected_lane_side": result.selected_lane_side,
-        "yellow_crossing_pixels": result.yellow_crossing_pixels,
-        "yellow_right_edge_x": safe_number(result.yellow_right_edge_x),
-        "right_lane_segment_found": result.right_lane_segment_found,
-        "right_lane_segment_left_x": safe_number(result.right_lane_segment_left_x),
-        "right_lane_segment_right_x": safe_number(result.right_lane_segment_right_x),
-        "right_lane_segment_width_px": safe_number(result.right_lane_segment_width_px),
-        "right_lane_lock_active": result.right_lane_lock_active,
-        "right_lane_lock_reason": result.right_lane_lock_reason,
-        "ego_reference_x": f"{result.ego_reference_x:.2f}",
-        "camera_center_offset_px": f"{result.camera_center_offset_px:.2f}",
-        "lane_center_x": safe_number(result.lane_center_x),
-        "left_space_mm": safe_number(result.left_space_mm),
-        "right_space_mm": safe_number(result.right_space_mm),
-        "unphysical_corridor_geometry": result.unphysical_corridor_geometry,
-        "steering_saturation_count": result.steering_saturation_count,
-        "helper_output_json": json.dumps(
-            build_helper_output(result, settings or {"camera_type": camera_type}, timestamp=time_sec, turn_hint=turn_hint),
-            sort_keys=True,
-        ),
-        "mask_area_pixels": mask_area_pixels,
-        "mask_area_percent": f"{mask_area_percent:.4f}",
-        "centerline_point_count": len(result.scan_points),
-        "processing_fps_estimate": f"{processing_fps:.2f}",
-    }
-
-
-def write_telemetry_row(writer, row):
-    # The telemetry CSV has one row per processed frame so later analysis can
-    # find trends, spikes, and frame ranges without watching the whole video.
-    writer.writerow(row)
-
-
-def write_event_row(writer, frame_index, time_sec, event_type, old_value, new_value, notes):
-    # The events CSV only records important changes so it is quick to skim.
-    writer.writerow(
-        {
-            "frame_index": frame_index,
-            "time_sec": f"{time_sec:.3f}",
-            "event_type": event_type,
-            "old_value": old_value,
-            "new_value": new_value,
-            "notes": notes,
-        }
-    )
-
-
-def detect_frame_events(frame_index, time_sec, result, turn_hint, previous_state):
-    events = []
-    current_state = {
-        "road_detected": result.road_detected,
-        "road_center_error_px": result.road_center_error_px,
-        "curve_error_px": result.curve_error_px,
-        "turn_hint": turn_hint,
-        "tracked_center_valid": result.tracked_center_valid,
-        "low_confidence": result.road_confidence < 0.60,
-        "rejected_scanlines_high": result.rejected_scanlines >= 5,
-        "safe_corridor_valid": result.safe_corridor_valid,
-        "safe_corridor_reason": result.safe_corridor_reason,
-    }
-
-    if previous_state is None:
-        if current_state["low_confidence"]:
-            events.append(("low_confidence_started", "", f"{result.road_confidence:.3f}", "Road confidence dropped below 0.60."))
-        if current_state["rejected_scanlines_high"]:
-            events.append(("rejected_scanlines_high_started", "", result.rejected_scanlines, "Five or more scanlines were rejected."))
-        if not current_state["safe_corridor_valid"]:
-            events.append(("safe_corridor_invalid_started", "", result.safe_corridor_reason, "Safe corridor helper is inactive."))
-        return events, current_state
-
-    if not previous_state["low_confidence"] and current_state["low_confidence"]:
-        events.append(("low_confidence_started", "", f"{result.road_confidence:.3f}", "Road confidence dropped below 0.60."))
-    if previous_state["low_confidence"] and not current_state["low_confidence"]:
-        events.append(("low_confidence_ended", "", f"{result.road_confidence:.3f}", "Road confidence recovered to 0.60 or higher."))
-    if not previous_state["rejected_scanlines_high"] and current_state["rejected_scanlines_high"]:
-        events.append(("rejected_scanlines_high_started", "", result.rejected_scanlines, "Five or more scanlines were rejected."))
-    if previous_state["rejected_scanlines_high"] and not current_state["rejected_scanlines_high"]:
-        events.append(("rejected_scanlines_high_ended", "", result.rejected_scanlines, "Rejected scanlines dropped below five."))
-    if previous_state["safe_corridor_valid"] and not current_state["safe_corridor_valid"]:
-        events.append(("safe_corridor_invalid_started", "valid", result.safe_corridor_reason, "Safe corridor changed from valid to inactive."))
-    if not previous_state["safe_corridor_valid"] and current_state["safe_corridor_valid"]:
-        events.append(("safe_corridor_invalid_ended", previous_state["safe_corridor_reason"], "valid", "Safe corridor helper became active."))
-    if (
-        not current_state["safe_corridor_valid"]
-        and previous_state["safe_corridor_reason"] != current_state["safe_corridor_reason"]
-    ):
-        events.append(("safe_corridor_reason_changed", previous_state["safe_corridor_reason"], result.safe_corridor_reason, "Safe corridor inactive reason changed."))
-
-    if previous_state["road_detected"] and not result.road_detected:
-        events.append(("road_lost", True, False, "Road detection changed from valid to lost."))
-    if not previous_state["road_detected"] and result.road_detected:
-        events.append(("road_recovered", False, True, "Road detection recovered after being lost."))
-
-    previous_center = previous_state["road_center_error_px"]
-    if previous_center is not None and result.road_center_error_px is not None:
-        center_jump = abs(result.road_center_error_px - previous_center)
-        # MAX_CENTER_JUMP_PX is already the live detector's guardrail for an unsafe center jump.
-        if center_jump > MAX_CENTER_JUMP_PX:
-            events.append(("center_jump", f"{previous_center:.2f}", f"{result.road_center_error_px:.2f}", f"Center error jumped by {center_jump:.1f}px."))
-
-    previous_curve = previous_state["curve_error_px"]
-    if previous_curve is not None and result.curve_error_px is not None:
-        curve_jump = abs(result.curve_error_px - previous_curve)
-        # CURVE_STRONG_PX is the threshold where a curve is considered strongly left/right.
-        if curve_jump > CURVE_STRONG_PX:
-            events.append(("curve_jump", f"{previous_curve:.2f}", f"{result.curve_error_px:.2f}", f"Curve error jumped by {curve_jump:.1f}px."))
-
-    if previous_state["turn_hint"] != turn_hint:
-        events.append(("turn_hint_changed", previous_state["turn_hint"], turn_hint, "Curve direction hint changed."))
-    return events, current_state
-
-
-def failure_reason_from_events(result, events):
-    event_types = [event[0] for event in events]
-    if not result.road_detected:
-        return "road_lost"
-    if not result.tracked_center_valid:
-        return "tracked_center_invalid"
-    if "low_confidence_started" in event_types:
-        return "low_confidence"
-    if "center_jump" in event_types:
-        return "center_jump"
-    if "curve_jump" in event_types:
-        return "curve_jump"
-    if "rejected_scanlines_high_started" in event_types:
-        return "rejected_scanlines"
-    if "safe_corridor_invalid_started" in event_types:
-        return f"safe_corridor_{result.safe_corridor_reason}"
-    return None
-
-
-def save_failure_frame(debug_frame, folder, frame_index, reason, saved_count, max_count, enabled):
-    # Failure frames are saved so ChatGPT or a human can inspect suspicious
-    # moments directly. They are capped because video can create many images.
-    if not enabled or reason is None or saved_count >= max_count:
-        return saved_count, False
-    path = folder / f"frame_{frame_index:05d}_{reason}_debug.jpg"
-    cv2.imwrite(str(path), debug_frame)
-    return saved_count + 1, True
-
-
-def save_periodic_ai_samples(frame, result, overlay, debug_frame, folder, frame_index, time_sec, next_sample_time, interval_sec):
-    # Periodic samples give AI analysis visual anchors without requiring every
-    # frame. The mask, overlay, and debug view explain different parts of the detector.
-    if interval_sec <= 0 or time_sec + 1e-9 < next_sample_time:
-        return next_sample_time
-
-    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_original.jpg"), frame)
-    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_raw_mask.jpg"), result.raw_mask)
-    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_ego_mask.jpg"), result.mask)
-    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_yellow_boundary_mask.jpg"), result.yellow_boundary_mask)
-    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_overlay.jpg"), overlay)
-    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_debug.jpg"), debug_frame)
-    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_safe_corridor_debug.jpg"), debug_frame)
-    return next_sample_time + interval_sec
-
-
-def save_key_frame(debug_frame, folder, frame_index, label, saved_keys):
-    key = (frame_index, label)
-    if key in saved_keys:
-        return
-    cv2.imwrite(str(folder / f"frame_{frame_index:06d}_{label}.jpg"), debug_frame)
-    saved_keys.add(key)
-
-
-def build_problem_intervals(problem_frames):
-    if not problem_frames:
-        return []
-
-    intervals = []
-    sorted_items = sorted(problem_frames, key=lambda item: (item["reason"], item["frame_index"]))
-    current = None
-
-    for item in sorted_items:
-        frame_index = item["frame_index"]
-        reason = item["reason"]
-        if current is None or current["reason"] != reason or frame_index - current["end_frame"] > 10:
-            if current is not None:
-                intervals.append(current)
-            current = {
-                "start_frame": frame_index,
-                "end_frame": frame_index,
-                "reason": reason,
-                "notes": item["notes"],
-            }
-        else:
-            current["end_frame"] = frame_index
-
-    if current is not None:
-        intervals.append(current)
-    return intervals
 
 
 def average(values):
@@ -2248,483 +1792,19 @@ def average(values):
     return sum(clean_values) / len(clean_values)
 
 
-def stddev(values):
-    clean_values = [float(value) for value in values if value not in (None, "")]
-    if len(clean_values) < 2:
-        return 0.0
-    mean = sum(clean_values) / len(clean_values)
-    return (sum((value - mean) ** 2 for value in clean_values) / len(clean_values)) ** 0.5
-
-
-def numeric_values(rows, key):
-    return [float(row[key]) for row in rows if row.get(key) not in (None, "")]
-
-
-def most_common_text(values, default="unknown"):
-    if not values:
-        return default
-    return Counter(values).most_common(1)[0][0]
-
-
-def build_recommendations(stats):
-    recommendations = []
-    if stats["road_detected_percent"] < 80.0:
-        recommendations.append("Road detection drops often")
-    if stats["max_abs_road_center_error_px"] > CENTER_STRONG_PX:
-        recommendations.append("Centerline jumps too much")
-    if stats["average_abs_curve_error_px"] > CURVE_DEADBAND_PX:
-        recommendations.append("Curve detection may need tuning")
-    if not recommendations and stats["average_road_confidence"] >= 0.60:
-        recommendations.append("Mask looks stable")
-    if not recommendations:
-        recommendations.append("This video is good enough for next-stage testing")
-    return recommendations
-
-
-def write_human_summary(path, args, processed_frames, duration_sec, stats, recommendations):
-    # Human summary is short prose for deciding whether the annotated video
-    # looks good enough before digging into CSV/JSON details.
-    lines = [
-        "QCar2 RGB road detector video summary",
-        "",
-        f"Input video path: {args.video}",
-        f"Total frames processed: {processed_frames}",
-        f"Duration: {duration_sec:.2f} sec",
-        f"Average road confidence: {stats['average_road_confidence']:.3f}",
-        f"Road detected percent: {stats['road_detected_percent']:.1f}%",
-        f"Average absolute road_center_error_px: {stats['average_abs_road_center_error_px']:.2f}",
-        f"Max absolute road_center_error_px: {stats['max_abs_road_center_error_px']:.2f}",
-        f"Average absolute curve_error_px: {stats['average_abs_curve_error_px']:.2f}",
-        f"Most common turn_hint: {stats['most_common_turn_hint']}",
-        f"Safe corridor valid percent: {stats['safe_corridor_valid_percent']:.1f}%",
-        f"Visual helper active percent: {stats['visual_helper_active_percent']:.1f}%",
-        f"Average measured lane width: {stats['average_measured_lane_width_mm']:.2f} mm",
-        f"Average absolute corridor center error: {stats['average_abs_corridor_center_error_mm']:.2f} mm",
-        f"Average valid left clearance: {stats['average_valid_left_clearance_mm']:.2f} mm",
-        f"Average valid right clearance: {stats['average_valid_right_clearance_mm']:.2f} mm",
-        f"Average valid absolute corridor error: {stats['average_valid_abs_corridor_center_error_mm']:.2f} mm",
-        f"Right-lane lock active percent: {stats['right_lane_lock_active_percent']:.1f}%",
-        f"Right-lane segment found percent: {stats['right_lane_segment_found_percent']:.1f}%",
-        "",
-        "Major problems found:",
-    ]
-    if stats["major_problems"]:
-        lines.extend([f"- {problem}" for problem in stats["major_problems"]])
-    else:
-        lines.append("- None detected from telemetry thresholds.")
-    lines.extend(["", "Simple recommendation:"])
-    lines.extend([f"- {recommendation}" for recommendation in recommendations])
-    if stats["inactive_reason_counts"]:
-        lines.extend(["", "Safe corridor inactive reasons:"])
-        lines.extend([f"- {reason}: {count}" for reason, count in stats["inactive_reason_counts"].items()])
-
-    with open(path, "w", encoding="utf-8") as file:
-        file.write("\n".join(lines) + "\n")
-
-
-def write_ai_summary_json(path, args, processed_frames, total_frames, duration_sec, completed, stopped_early, stats, settings, config_source, problem_intervals):
-    # AI summary is structured so ChatGPT can reason over the run without
-    # guessing values from the annotated video.
-    payload = {
-        "input_video": args.video,
-        "output_created_at": datetime.now().isoformat(timespec="seconds"),
-        "total_frames": total_frames,
-        "processed_frames": processed_frames,
-        "duration_sec": duration_sec,
-        "completed_full_video": completed,
-        "stopped_early": stopped_early,
-        "average_road_confidence": stats["average_road_confidence"],
-        "min_road_confidence": stats["min_road_confidence"],
-        "max_road_confidence": stats["max_road_confidence"],
-        "road_detected_percent": stats["road_detected_percent"],
-        "average_abs_road_center_error_px": stats["average_abs_road_center_error_px"],
-        "max_abs_road_center_error_px": stats["max_abs_road_center_error_px"],
-        "average_abs_curve_error_px": stats["average_abs_curve_error_px"],
-        "max_abs_curve_error_px": stats["max_abs_curve_error_px"],
-        "low_confidence_frame_count": stats["low_confidence_frame_count"],
-        "rejected_scanline_problem_count": stats["rejected_scanline_problem_count"],
-        "center_jump_count": stats["center_jump_count"],
-        "curve_jump_count": stats["curve_jump_count"],
-        "tracked_center_invalid_count": stats["tracked_center_invalid_count"],
-        "turn_hint_counts": stats["turn_hint_counts"],
-        "safe_corridor_valid_percent": stats["safe_corridor_valid_percent"],
-        "visual_helper_active_percent": stats["visual_helper_active_percent"],
-        "average_measured_lane_width_mm": stats["average_measured_lane_width_mm"],
-        "lane_width_std_mm": stats["lane_width_std_mm"],
-        "average_left_clearance_mm": stats["average_left_clearance_mm"],
-        "average_right_clearance_mm": stats["average_right_clearance_mm"],
-        "average_abs_corridor_center_error_mm": stats["average_abs_corridor_center_error_mm"],
-        "max_abs_corridor_center_error_mm": stats["max_abs_corridor_center_error_mm"],
-        "inactive_reason_counts": stats["inactive_reason_counts"],
-        "unphysical_corridor_geometry_count": stats["unphysical_corridor_geometry_count"],
-        "steering_saturated_too_long_count": stats["steering_saturated_too_long_count"],
-        "average_valid_left_clearance_mm": stats["average_valid_left_clearance_mm"],
-        "average_valid_right_clearance_mm": stats["average_valid_right_clearance_mm"],
-        "average_valid_abs_corridor_center_error_mm": stats["average_valid_abs_corridor_center_error_mm"],
-        "visual_steering_saturation_percent": stats["visual_steering_saturation_percent"],
-        "right_lane_lock_active_percent": stats["right_lane_lock_active_percent"],
-        "right_lane_segment_found_percent": stats["right_lane_segment_found_percent"],
-        "wide_blob_no_yellow_count": stats["wide_blob_no_yellow_count"],
-        "yellow_visible_no_right_segment_count": stats["yellow_visible_no_right_segment_count"],
-        "config_used": get_config_used(settings, config_source),
-        "known_problem_intervals": problem_intervals,
-    }
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(payload, file, indent=2)
-
-
-def write_run_notes(path, args, folders):
-    # These notes tell a future ChatGPT session what each output means and
-    # which files are worth uploading first.
-    command = " ".join(sys.argv)
-    notes = [
-        "QCar2 RGB road detector offline video run notes",
-        "",
-        f"Command used: {command}",
-        f"Requested video path: {args.video}",
-        f"Outputs root: {folders['root']}",
-        f"Human output folder: {folders['human']}",
-        f"AI output folder: {folders['ai']}",
-        "",
-        "What the detector is supposed to do:",
-        "It uses RGB/OpenCV/NumPy HSV masking to detect the dark road surface, tracks scanline centers, estimates lateral center error, estimates curve direction, and writes an annotated result.",
-        "",
-        "Main output files:",
-        "- human_output annotated MP4: watch this for visual inspection.",
-        "- telemetry CSV: one row per processed frame with numeric detector state.",
-        "- events CSV: only important changes such as road loss, low confidence, jumps, and helper state changes.",
-        "- summary AI JSON: structured run summary and grouped problem intervals.",
-        "- config used JSON: exact HSV/ROI/math thresholds used for the run.",
-        "- frame_samples: periodic original/raw_mask/ego_mask/overlay/debug/safe_corridor_debug images.",
-        "- failure_frames: suspicious debug frames, capped by command-line settings.",
-        "",
-        "Known limitations:",
-        "- No machine learning, no training, no YOLO, no PyTorch, no TensorFlow.",
-        "- RGB only; no ROS2 and no RealSense depth processing yet.",
-        "- Lighting changes and road color changes may require HSV retuning.",
-        "- The blue safe corridor is a drift helper only; it is not a path planner.",
-        "",
-        "Files to upload to ChatGPT for analysis:",
-        "- test_video_telemetry.csv",
-        "- test_video_events.csv",
-        "- test_video_summary_ai.json",
-        "- test_video_config_used.json",
-        "- selected frame_samples",
-        "- selected failure_frames",
-    ]
-    with open(path, "w", encoding="utf-8") as file:
-        file.write("\n".join(notes) + "\n")
-
-
-def collect_stats(rows, event_counts, processed_frames):
-    confidences = [float(row["road_confidence"]) for row in rows]
-    center_errors = [row["road_center_error_px"] for row in rows if row["road_center_error_px"] != ""]
-    curve_errors = [row["curve_error_px"] for row in rows if row["curve_error_px"] != ""]
-    road_detected_count = sum(1 for row in rows if row["road_detected"] is True)
-    low_confidence_frame_count = sum(1 for row in rows if float(row["road_confidence"]) < 0.60)
-    rejected_scanline_problem_count = sum(1 for row in rows if int(row["rejected_scanlines"]) >= 5)
-    turn_hint_counts = Counter(row["turn_hint"] for row in rows)
-    safe_valid_count = sum(1 for row in rows if row["safe_corridor_valid"] is True)
-    helper_active_count = sum(1 for row in rows if row["visual_helper_active"] is True)
-    lane_widths_mm = numeric_values(rows, "measured_lane_width_mm")
-    left_clearances_mm = numeric_values(rows, "left_clearance_mm")
-    right_clearances_mm = numeric_values(rows, "right_clearance_mm")
-    corridor_errors_mm = numeric_values(rows, "corridor_center_error_mm")
-    steering_corrections = numeric_values(rows, "visual_steering_correction")
-    valid_safe_rows = [row for row in rows if row["safe_corridor_valid"] is True]
-    valid_left_clearances = numeric_values(valid_safe_rows, "left_clearance_mm")
-    valid_right_clearances = numeric_values(valid_safe_rows, "right_clearance_mm")
-    valid_corridor_errors = numeric_values(valid_safe_rows, "corridor_center_error_mm")
-    inactive_reason_counts = Counter(
-        row["safe_corridor_reason"] for row in rows if row["safe_corridor_reason"] != "valid"
-    )
-    right_lane_lock_active_count = sum(1 for row in rows if row.get("right_lane_lock_active") is True)
-    right_lane_segment_found_count = sum(1 for row in rows if row.get("right_lane_segment_found") is True)
-
-    abs_center_errors = [abs(float(value)) for value in center_errors]
-    abs_curve_errors = [abs(float(value)) for value in curve_errors]
-    road_detected_percent = road_detected_count / max(1, processed_frames) * 100.0
-
-    major_problems = []
-    if low_confidence_frame_count > 0:
-        major_problems.append(f"{low_confidence_frame_count} low-confidence frames")
-    if event_counts["road_lost"] > 0:
-        major_problems.append(f"{event_counts['road_lost']} road-lost events")
-    if event_counts["center_jump"] > 0:
-        major_problems.append(f"{event_counts['center_jump']} center-jump events")
-    if event_counts["curve_jump"] > 0:
-        major_problems.append(f"{event_counts['curve_jump']} curve-jump events")
-    if rejected_scanline_problem_count > 0:
-        major_problems.append(f"{rejected_scanline_problem_count} high rejected-scanline frames")
-    if inactive_reason_counts:
-        reason, count = inactive_reason_counts.most_common(1)[0]
-        major_problems.append(f"{count} safe-corridor inactive frames, most often {reason}")
-
-    return {
-        "average_road_confidence": average(confidences),
-        "min_road_confidence": min(confidences) if confidences else 0.0,
-        "max_road_confidence": max(confidences) if confidences else 0.0,
-        "road_detected_percent": road_detected_percent,
-        "average_abs_road_center_error_px": average(abs_center_errors),
-        "max_abs_road_center_error_px": max(abs_center_errors) if abs_center_errors else 0.0,
-        "average_abs_curve_error_px": average(abs_curve_errors),
-        "max_abs_curve_error_px": max(abs_curve_errors) if abs_curve_errors else 0.0,
-        "low_confidence_frame_count": low_confidence_frame_count,
-        "rejected_scanline_problem_count": rejected_scanline_problem_count,
-        "center_jump_count": event_counts["center_jump"],
-        "curve_jump_count": event_counts["curve_jump"],
-        "tracked_center_invalid_count": sum(1 for row in rows if row["tracked_center_valid"] is False),
-        "turn_hint_counts": dict(turn_hint_counts),
-        "most_common_turn_hint": most_common_text([row["turn_hint"] for row in rows]),
-        "safe_corridor_valid_percent": safe_valid_count / max(1, processed_frames) * 100.0,
-        "visual_helper_active_percent": helper_active_count / max(1, processed_frames) * 100.0,
-        "average_measured_lane_width_mm": average(lane_widths_mm),
-        "lane_width_std_mm": stddev(lane_widths_mm),
-        "average_left_clearance_mm": average(left_clearances_mm),
-        "average_right_clearance_mm": average(right_clearances_mm),
-        "average_abs_corridor_center_error_mm": average([abs(value) for value in corridor_errors_mm]),
-        "max_abs_corridor_center_error_mm": max([abs(value) for value in corridor_errors_mm]) if corridor_errors_mm else 0.0,
-        "average_abs_visual_steering_correction": average([abs(value) for value in steering_corrections]),
-        "average_valid_left_clearance_mm": average(valid_left_clearances),
-        "average_valid_right_clearance_mm": average(valid_right_clearances),
-        "average_valid_abs_corridor_center_error_mm": average([abs(value) for value in valid_corridor_errors]),
-        "unphysical_corridor_geometry_count": inactive_reason_counts["unphysical_corridor_geometry"],
-        "steering_saturated_too_long_count": inactive_reason_counts["steering_saturated_too_long"],
-        "visual_steering_saturation_percent": (
-            sum(
-                1
-                for row in rows
-                if abs(float(row["visual_steering_correction"])) >= SAFE_MAX_STEERING_CORRECTION - 1e-9
-            )
-            / max(1, processed_frames)
-            * 100.0
-        ),
-        "inactive_reason_counts": dict(inactive_reason_counts),
-        "right_lane_lock_active_percent": right_lane_lock_active_count / max(1, processed_frames) * 100.0,
-        "right_lane_segment_found_percent": right_lane_segment_found_count / max(1, processed_frames) * 100.0,
-        "wide_blob_no_yellow_count": inactive_reason_counts["wide_blob_no_yellow"],
-        "yellow_visible_no_right_segment_count": inactive_reason_counts["yellow_visible_no_right_segment"],
-        "major_problems": major_problems,
-    }
-
-
-def process_video_tuning_mode(args):
-    # Manual video tuning is the human-in-the-loop camera setup step. The
-    # user pauses on hard frames, adjusts simple RGB/OpenCV/NumPy mask values,
-    # and saves a camera config for later video analysis or ROS2 porting.
-    if not args.video:
-        raise RuntimeError("--video is required when tuning a video source")
-    video_path = Path(args.video)
-    if not video_path.exists():
-        raise RuntimeError(f"Could not find video: {video_path}")
-
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-
-    settings, config_source = load_manual_tuning_settings(args)
-    print(f"Manual tuning config source: {config_source}")
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    source_fps = cap.get(cv2.CAP_PROP_FPS)
-    if source_fps <= 0:
-        source_fps = 30.0
-
-    folders = create_manual_tuning_folders()
-    config_output_path = Path(args.config_output or args.config)
-    session_output_path = Path(args.session_output)
-    session = {
-        "good_sample_frames": [],
-        "difficult_sample_frames": [],
-        "debug_snapshot_frames": [],
-    }
-    last_saved_frame_index = None
-
-    # Trackbars expose the same beginner-friendly parameters as live tuning:
-    # HSV chooses road-colored pixels, ROI_top_percent ignores the upper scene,
-    # Morph_kernel removes small white noise, and Close_kernel fills small gaps.
-    create_trackbars(settings)
-    cv2.namedWindow(WINDOW_MAIN, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(WINDOW_VIDEO_CONTROL, cv2.WINDOW_NORMAL)
-    cv2.createTrackbar("Frame", WINDOW_VIDEO_CONTROL, 0, max(1, total_frames - 1), nothing)
-
-    current_frame_index = seek_video_frame(cap, args.start_frame, total_frames)
-    update_video_control_trackbar(current_frame_index, total_frames)
-    playback_speed = max(0.1, float(args.playback_speed))
-    paused = False
-    show_mask_window = False
-    use_ego_connected_mask = USE_EGO_CONNECTED_MASK
-    use_yellow_boundary_lock = USE_YELLOW_BOUNDARY_LOCK
-    last_center_x = None
-    frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
-    lane_side_memory = {}
-    safe_corridor_state = {}
-    drift_state = {}
-
-    print("Manual video tuning controls:")
-    print("q/ESC quit | p/SPACE pause | s save config | l load config-output | r reset")
-    print("e toggle ego-connected mask | y toggle yellow-boundary lock | m mask window")
-    print("g good sample | f difficult sample | d debug snapshot | n/right next | b/left back")
-
-    try:
-        while True:
-            control_frame = cv2.getTrackbarPos("Frame", WINDOW_VIDEO_CONTROL)
-            if total_frames > 0 and control_frame != current_frame_index:
-                current_frame_index = seek_video_frame(cap, control_frame, total_frames)
-                last_center_x = None
-                frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
-
-            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_index)
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                break
-
-            frame = resize_frame(frame)
-            settings = get_trackbar_settings(settings)
-            result = detect_road(
-                frame,
-                settings,
-                last_center_x,
-                frames_since_valid,
-                use_ego_connected_mask,
-                settings,
-                use_yellow_boundary_lock,
-                lane_side_memory,
-                safe_corridor_state,
-            )
-            if result.road_detected and result.road_center_x is not None:
-                last_center_x = result.road_center_x
-                frames_since_valid = 0
-            else:
-                frames_since_valid += 1
-
-            turn_hint = compute_turn_hint(result.curve_error_px, settings)
-            apply_drift_only_gate(result, turn_hint, drift_state, settings)
-            show_inactive_helper = getattr(args, "show_inactive_helper", False) or cfg_bool(settings, "SHOW_INACTIVE_HELPER_DEFAULT", False)
-            debug_frame = draw_visualization(frame, result, turn_hint, settings, show_inactive_helper)
-            overlay = build_road_overlay(frame, result, settings, show_inactive_helper)
-            display = build_display_grid(frame, result, debug_frame, settings, show_inactive_helper)
-            cv2.putText(
-                display,
-                f"Frame {current_frame_index}/{max(0, total_frames - 1)}  speed {playback_speed:.1f}x  ego {use_ego_connected_mask} yellow {use_yellow_boundary_lock}",
-                (12, FRAME_HEIGHT - 14),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.62,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.imshow(WINDOW_MAIN, display)
-            if show_mask_window:
-                cv2.imshow(WINDOW_MASK, result.mask)
-            else:
-                try:
-                    cv2.destroyWindow(WINDOW_MASK)
-                except cv2.error:
-                    pass
-
-            update_video_control_trackbar(current_frame_index, total_frames)
-            delay_ms = 40 if paused else max(1, int(1000.0 / (source_fps * playback_speed)))
-            key = cv2.waitKeyEx(delay_ms)
-
-            if key in (ord("q"), 27):
-                break
-            if key in (ord("p"), 32):
-                paused = not paused
-                print("Paused." if paused else "Playing.")
-            elif key == ord("s"):
-                save_manual_tuning_config(config_output_path, settings, video_path, current_frame_index)
-                last_saved_frame_index = current_frame_index
-                save_manual_tuning_session(
-                    session_output_path,
-                    video_path,
-                    last_saved_frame_index,
-                    config_output_path,
-                    session,
-                    settings,
-                )
-            elif key == ord("l"):
-                if config_output_path.exists():
-                    settings = load_settings_file(config_output_path)
-                    set_trackbars(settings)
-                    print(f"Loaded manual tuning config from {config_output_path}")
-                else:
-                    print(f"No manual tuning config found at {config_output_path}")
-            elif key == ord("r"):
-                settings = DEFAULT_SETTINGS.copy()
-                set_trackbars(settings)
-                last_center_x = None
-                frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
-                print("Reset tuning settings to DEFAULT_SETTINGS.")
-            elif key == ord("m"):
-                show_mask_window = not show_mask_window
-            elif key == ord("e"):
-                use_ego_connected_mask = not use_ego_connected_mask
-                last_center_x = None
-                frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
-                print(f"Ego-connected mask {'on' if use_ego_connected_mask else 'off'}.")
-            elif key == ord("y"):
-                use_yellow_boundary_lock = not use_yellow_boundary_lock
-                lane_side_memory.clear()
-                last_center_x = None
-                frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
-                print(f"Yellow-boundary lock {'on' if use_yellow_boundary_lock else 'off'}.")
-            elif key in (ord("n"), 83, 2555904):
-                paused = True
-                current_frame_index = seek_video_frame(cap, current_frame_index + 1, total_frames)
-            elif key in (ord("b"), 81, 2424832):
-                paused = True
-                current_frame_index = seek_video_frame(cap, current_frame_index - 1, total_frames)
-            elif key == ord("g"):
-                list_name = save_tuning_sample("good", folders, current_frame_index, frame, result, overlay, debug_frame)
-                if current_frame_index not in session[list_name]:
-                    session[list_name].append(current_frame_index)
-                save_manual_tuning_session(session_output_path, video_path, last_saved_frame_index, config_output_path, session, settings)
-            elif key == ord("f"):
-                list_name = save_tuning_sample("difficult", folders, current_frame_index, frame, result, overlay, debug_frame)
-                if current_frame_index not in session[list_name]:
-                    session[list_name].append(current_frame_index)
-                save_manual_tuning_session(session_output_path, video_path, last_saved_frame_index, config_output_path, session, settings)
-            elif key == ord("d"):
-                list_name = save_tuning_sample("debug", folders, current_frame_index, frame, result, overlay, debug_frame)
-                if current_frame_index not in session[list_name]:
-                    session[list_name].append(current_frame_index)
-                save_manual_tuning_session(session_output_path, video_path, last_saved_frame_index, config_output_path, session, settings)
-            elif key == ord("["):
-                playback_speed = max(0.1, playback_speed / 1.25)
-                print(f"Playback speed: {playback_speed:.2f}x")
-            elif key == ord("]"):
-                playback_speed = min(8.0, playback_speed * 1.25)
-                print(f"Playback speed: {playback_speed:.2f}x")
-
-            if not paused and key not in (ord("n"), ord("b"), 83, 81, 2555904, 2424832):
-                current_frame_index += 1
-                if total_frames > 0 and current_frame_index >= total_frames:
-                    current_frame_index = total_frames - 1
-                    paused = True
-
-    finally:
-        save_manual_tuning_session(
-            session_output_path,
-            video_path,
-            last_saved_frame_index,
-            config_output_path,
-            session,
-            settings,
-        )
-        cap.release()
-        cv2.destroyAllWindows()
-
-    print("Manual video tuning complete.")
-    print(f"Manual config output: {config_output_path}")
-    print(f"Session output: {session_output_path}")
-    print(f"Sample folders: {folders['root']}")
-    return 0
+def save_debug_snapshot(frame, result, debug_frame, frame_index):
+    folder = Path("outputs") / "debug_snapshots"
+    folder.mkdir(parents=True, exist_ok=True)
+    prefix = folder / f"frame_{frame_index:06d}"
+    cv2.imwrite(str(prefix) + "_original.jpg", frame)
+    cv2.imwrite(str(prefix) + "_mask.jpg", result.mask)
+    cv2.imwrite(str(prefix) + "_debug.jpg", debug_frame)
+    print(f"Saved debug snapshot: {prefix}_*.jpg")
 
 
 def process_video_source(args):
-    # Offline video mode is useful because it lets the exact same RGB detector
-    # be replayed, measured, and inspected without needing the QCar2 or camera live.
+    # Local video mode is only a stand-in for the future ROS2 image callback.
+    # It displays each processed frame and prints a compact final summary.
     video_path = Path(args.video)
     if not video_path.exists():
         raise RuntimeError(f"Could not find video: {video_path}")
@@ -2733,8 +1813,6 @@ def process_video_source(args):
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
 
-    base_name = get_output_base_name(video_path)
-    folders = create_output_folders(args.output_dir, base_name, args.clean_output)
     settings, config_source = load_video_settings(args)
     print(f"Video config source: {config_source}")
 
@@ -2743,301 +1821,103 @@ def process_video_source(args):
     if source_fps <= 0:
         source_fps = 30.0
 
-    annotated_path = folders["human"] / f"{base_name}_annotated.mp4"
-    telemetry_path = folders["ai"] / f"{base_name}_telemetry.csv"
-    events_path = folders["ai"] / f"{base_name}_events.csv"
-    summary_path = folders["human"] / f"{base_name}_summary.txt"
-    ai_summary_path = folders["ai"] / f"{base_name}_summary_ai.json"
-    config_path = folders["ai"] / f"{base_name}_config_used.json"
-    run_notes_path = folders["ai"] / f"{base_name}_run_notes.txt"
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(annotated_path), fourcc, source_fps, (FRAME_WIDTH, FRAME_HEIGHT))
-    if not writer.isOpened():
-        raise RuntimeError(f"Could not create annotated video: {annotated_path}")
-
-    telemetry_fields = [
-        "frame_index",
-        "time_sec",
-        "road_detected",
-        "road_confidence",
-        "road_center_error_px",
-        "curve_error_px",
-        "turn_hint",
-        "near_center_x",
-        "far_center_x",
-        "tracked_center_valid",
-        "rejected_scanlines",
-        "valid_scanline_count",
-        "detection_quality",
-        "seed_center_x",
-        "first_anchor_x",
-        "first_anchor_distance_px",
-        "ego_component_found",
-        "ego_seed_x",
-        "ego_seed_y",
-        "ego_anchor_x",
-        "ego_anchor_y",
-        "ego_component_area_pixels",
-        "ego_component_area_percent",
-        "ego_component_fallback_used",
-        "safe_corridor_valid",
-        "visual_helper_active",
-        "safe_corridor_width_mm",
-        "safe_corridor_width_px",
-        "measured_lane_width_mm",
-        "measured_lane_width_px",
-        "lane_width_valid",
-        "left_clearance_mm",
-        "right_clearance_mm",
-        "corridor_center_error_mm",
-        "corridor_center_error_px",
-        "visual_steering_correction",
-        "safe_scanline_count_valid",
-        "safe_corridor_reason",
-        "yellow_boundary_detected",
-        "yellow_boundary_pixel_count",
-        "yellow_boundary_enforced",
-        "selected_lane_side",
-        "yellow_crossing_pixels",
-        "yellow_right_edge_x",
-        "right_lane_segment_found",
-        "right_lane_segment_left_x",
-        "right_lane_segment_right_x",
-        "right_lane_segment_width_px",
-        "right_lane_lock_active",
-        "right_lane_lock_reason",
-        "ego_reference_x",
-        "camera_center_offset_px",
-        "lane_center_x",
-        "left_space_mm",
-        "right_space_mm",
-        "unphysical_corridor_geometry",
-        "steering_saturation_count",
-        "helper_output_json",
-        "mask_area_pixels",
-        "mask_area_percent",
-        "centerline_point_count",
-        "processing_fps_estimate",
-    ]
-    event_fields = ["frame_index", "time_sec", "event_type", "old_value", "new_value", "notes"]
-
-    if not args.no_display:
-        create_trackbars(settings)
+    if args.display:
         cv2.namedWindow(WINDOW_MAIN, cv2.WINDOW_NORMAL)
 
-    show_mask_window = False
     paused = False
-    stopped_early = False
     last_center_x = None
     frames_since_valid = LAST_CENTER_HOLD_FRAMES + 1
     lane_side_memory = {}
     safe_corridor_state = {}
     drift_state = {}
     frame_index = 0
-    processed_frames = 0
-    failure_saved_count = 0
     last_progress_time = time.perf_counter()
     run_start_time = time.perf_counter()
-    next_sample_time = 0.0
-    previous_state = None
-    rows = []
-    event_counts = Counter()
-    problem_frames = []
-    saved_keys = set()
-    middle_frame_index = max(0, total_frames // 2) if total_frames > 0 else None
-    last_debug_frame = None
 
-    save_config_used(config_path, settings, config_source)
-    write_run_notes(run_notes_path, args, folders)
+    stats = {"frames": 0, "safe_valid": 0, "helper_active": 0, "valid_errors": [], "reasons": {}}
 
-    with open(telemetry_path, "w", newline="", encoding="utf-8") as telemetry_file, open(
-        events_path, "w", newline="", encoding="utf-8"
-    ) as events_file:
-        telemetry_writer = csv.DictWriter(telemetry_file, fieldnames=telemetry_fields)
-        events_writer = csv.DictWriter(events_file, fieldnames=event_fields)
-        telemetry_writer.writeheader()
-        events_writer.writeheader()
-
-        try:
-            while True:
-                if paused:
-                    key = cv2.waitKey(40) & 0xFF
-                    action = handle_key(key, settings)
-                    if action == "quit":
-                        stopped_early = True
-                        break
-                    if action == "toggle_pause":
-                        paused = False
-                        print("Unpaused.")
-                    continue
-
-                ok, frame = cap.read()
-                if not ok or frame is None:
+    try:
+        while True:
+            if paused:
+                key = cv2.waitKey(40) & 0xFF
+                action = handle_key(key, settings)
+                if action == "quit":
                     break
+                if action == "toggle_pause":
+                    paused = False
+                    print("Unpaused.")
+                continue
 
-                frame = resize_frame(frame)
-                if not args.no_display:
-                    settings = get_trackbar_settings(settings)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
 
-                time_sec = frame_index / source_fps
-                elapsed = max(0.001, time.perf_counter() - run_start_time)
-                processing_fps = processed_frames / elapsed
+            frame = resize_frame(frame)
+            result = detect_road(
+                frame,
+                settings,
+                last_center_x,
+                frames_since_valid,
+                detector_config=settings,
+                lane_side_memory=lane_side_memory,
+                safe_corridor_state=safe_corridor_state,
+            )
 
-                result = detect_road(
-                    frame,
-                    settings,
-                    last_center_x,
-                    frames_since_valid,
-                    detector_config=settings,
-                    lane_side_memory=lane_side_memory,
-                    safe_corridor_state=safe_corridor_state,
-                )
+            if result.road_detected and result.road_center_x is not None:
+                last_center_x = result.road_center_x
+                frames_since_valid = 0
+            else:
+                frames_since_valid += 1
 
-                if result.road_detected and result.road_center_x is not None:
-                    last_center_x = result.road_center_x
-                    frames_since_valid = 0
-                else:
-                    frames_since_valid += 1
+            turn_hint = compute_turn_hint(result.curve_error_px, settings)
+            apply_drift_only_gate(result, turn_hint, drift_state, settings)
+            show_inactive_helper = args.show_inactive_helper or cfg_bool(settings, "SHOW_INACTIVE_HELPER_DEFAULT", False)
+            debug_frame = draw_visualization(frame, result, turn_hint, settings, show_inactive_helper, args.show_debug)
 
-                turn_hint = compute_turn_hint(result.curve_error_px, settings)
-                apply_drift_only_gate(result, turn_hint, drift_state, settings)
-                show_inactive_helper = args.show_inactive_helper or cfg_bool(settings, "SHOW_INACTIVE_HELPER_DEFAULT", False)
-                debug_frame = draw_visualization(frame, result, turn_hint, settings, show_inactive_helper)
-                overlay = build_road_overlay(frame, result, settings, show_inactive_helper)
-                writer.write(debug_frame)
-                last_debug_frame = debug_frame.copy()
+            stats["frames"] += 1
+            stats["safe_valid"] += int(result.safe_corridor_valid)
+            stats["helper_active"] += int(result.visual_helper_active)
+            if result.safe_corridor_valid and result.corridor_center_error_mm is not None:
+                stats["valid_errors"].append(abs(result.corridor_center_error_mm))
+            if result.safe_corridor_reason != "valid":
+                stats["reasons"][result.safe_corridor_reason] = stats["reasons"].get(result.safe_corridor_reason, 0) + 1
 
-                telemetry_row = build_telemetry_row(
-                    frame_index,
-                    time_sec,
-                    result,
-                    turn_hint,
-                    processing_fps,
-                    camera_type=str(settings.get("camera_type", "unknown")),
-                    settings=settings,
-                )
-                write_telemetry_row(telemetry_writer, telemetry_row)
-                rows.append(telemetry_row)
+            now = time.perf_counter()
+            if now - last_progress_time >= 2.0:
+                elapsed = max(0.001, now - run_start_time)
+                rate = stats["frames"] / elapsed
+                helper = build_helper_output(result, settings, timestamp=frame_index / source_fps, turn_hint=turn_hint)
+                print(f"frame {frame_index}/{total_frames} fps={rate:.1f} helper={helper}")
+                last_progress_time = now
 
-                events, previous_state = detect_frame_events(
-                    frame_index,
-                    time_sec,
-                    result,
-                    turn_hint,
-                    previous_state,
-                )
-                for event_type, old_value, new_value, notes in events:
-                    write_event_row(events_writer, frame_index, time_sec, event_type, old_value, new_value, notes)
-                    event_counts[event_type] += 1
-                    if event_type in ("turn_hint_changed", "road_lost", "road_recovered"):
-                        save_key_frame(debug_frame, folders["key_frames"], frame_index, event_type, saved_keys)
+            if args.display:
+                cv2.imshow(WINDOW_MAIN, build_display_grid(frame, result, debug_frame, settings, show_inactive_helper))
+                key = cv2.waitKey(1) & 0xFF
+                action = handle_key(key, settings)
+                if action == "quit":
+                    break
+                if action == "toggle_pause":
+                    paused = True
+                    print("Paused.")
+                elif key == ord("d"):
+                    save_debug_snapshot(frame, result, debug_frame, frame_index)
 
-                failure_reason = failure_reason_from_events(result, events)
-                if failure_reason is not None:
-                    problem_frames.append(
-                        {
-                            "frame_index": frame_index,
-                            "reason": failure_reason,
-                            "notes": f"Suspicious frame detected because of {failure_reason}.",
-                        }
-                    )
-                failure_saved_count, _saved = save_failure_frame(
-                    debug_frame,
-                    folders["failure_frames"],
-                    frame_index,
-                    failure_reason,
-                    failure_saved_count,
-                    max(0, args.max_failure_frames),
-                    args.save_failure_frames,
-                )
+            frame_index += 1
+    finally:
+        cap.release()
+        if args.display:
+            cv2.destroyAllWindows()
 
-                next_sample_time = save_periodic_ai_samples(
-                    frame,
-                    result,
-                    overlay,
-                    debug_frame,
-                    folders["frame_samples"],
-                    frame_index,
-                    time_sec,
-                    next_sample_time,
-                    args.ai_sample_interval_sec,
-                )
-
-                if frame_index == 0:
-                    save_key_frame(debug_frame, folders["key_frames"], frame_index, "start", saved_keys)
-                if middle_frame_index is not None and frame_index == middle_frame_index:
-                    save_key_frame(debug_frame, folders["key_frames"], frame_index, "middle", saved_keys)
-
-                processed_frames += 1
-                now = time.perf_counter()
-                if now - last_progress_time >= 3.0:
-                    percent = frame_index / max(1, total_frames) * 100.0 if total_frames > 0 else 0.0
-                    print(
-                        f"Video progress: frame {frame_index}/{total_frames} "
-                        f"({percent:.1f}%), processing {processing_fps:.1f} FPS"
-                    )
-                    last_progress_time = now
-
-                if not args.no_display:
-                    cv2.imshow(WINDOW_MAIN, build_display_grid(frame, result, debug_frame, settings, show_inactive_helper))
-                    if show_mask_window:
-                        cv2.imshow(WINDOW_MASK, result.mask)
-                    else:
-                        try:
-                            cv2.destroyWindow(WINDOW_MASK)
-                        except cv2.error:
-                            pass
-
-                    key = cv2.waitKey(1) & 0xFF
-                    action = handle_key(key, settings)
-                    if action == "quit":
-                        stopped_early = True
-                        break
-                    if action == "toggle_mask":
-                        show_mask_window = not show_mask_window
-                    elif action == "toggle_pause":
-                        paused = True
-                        print("Paused.")
-
-                frame_index += 1
-        finally:
-            cap.release()
-            writer.release()
-            if not args.no_display:
-                cv2.destroyAllWindows()
-
-    if last_debug_frame is not None:
-        save_key_frame(last_debug_frame, folders["key_frames"], max(0, frame_index - 1), "end", saved_keys)
-
-    duration_sec = processed_frames / source_fps if source_fps > 0 else 0.0
-    completed = not stopped_early and (total_frames <= 0 or processed_frames >= total_frames)
-    stats = collect_stats(rows, event_counts, processed_frames)
-    recommendations = build_recommendations(stats)
-    problem_intervals = build_problem_intervals(problem_frames)
-
-    write_human_summary(summary_path, args, processed_frames, duration_sec, stats, recommendations)
-    write_ai_summary_json(
-        ai_summary_path,
-        args,
-        processed_frames,
-        total_frames,
-        duration_sec,
-        completed,
-        stopped_early,
-        stats,
-        settings,
-        config_source,
-        problem_intervals,
-    )
-
+    frames = max(1, stats["frames"])
     print()
     print("Video processing complete.")
-    print(f"Output folder: {folders['root']}")
-    print(f"Human output: {folders['human']}")
-    print(f"AI output: {folders['ai']}")
-    print(f"Frames processed: {processed_frames}")
-    print(f"Failure frames saved: {failure_saved_count}")
+    print(f"Frames processed: {stats['frames']}")
+    print(f"safe_corridor_valid_percent: {stats['safe_valid'] / frames * 100.0:.2f}")
+    print(f"visual_helper_active_percent: {stats['helper_active'] / frames * 100.0:.2f}")
+    print(f"average_valid_abs_corridor_center_error_mm: {average(stats['valid_errors']):.2f}")
+    print("Top safe_corridor_reason counts:")
+    for reason, count in sorted(stats["reasons"].items(), key=lambda item: item[1], reverse=True)[:5]:
+        print(f"  {reason}: {count}")
     return 0
 
 
@@ -3059,10 +1939,9 @@ def main():
         return 1
 
     settings, _config_source = load_video_settings(args)
-    create_trackbars(settings)
-    cv2.namedWindow(WINDOW_MAIN, cv2.WINDOW_NORMAL)
+    if args.display:
+        cv2.namedWindow(WINDOW_MAIN, cv2.WINDOW_NORMAL)
 
-    show_mask_window = False
     paused = False
     last_frame = None
     last_center_x = None
@@ -3081,7 +1960,6 @@ def main():
                 last_frame = resize_frame(frame)
 
             frame = last_frame.copy()
-            settings = get_trackbar_settings(settings)
             result = detect_road(
                 frame,
                 settings,
@@ -3100,30 +1978,27 @@ def main():
             turn_hint = compute_turn_hint(result.curve_error_px, settings)
             apply_drift_only_gate(result, turn_hint, drift_state, settings)
             show_inactive_helper = args.show_inactive_helper or cfg_bool(settings, "SHOW_INACTIVE_HELPER_DEFAULT", False)
-            visualization = draw_visualization(frame, result, turn_hint, settings, show_inactive_helper)
-            display = build_display_grid(frame, result, visualization, settings, show_inactive_helper)
-            cv2.imshow(WINDOW_MAIN, display)
+            visualization = draw_visualization(frame, result, turn_hint, settings, show_inactive_helper, args.show_debug)
+            if args.display:
+                display = build_display_grid(frame, result, visualization, settings, show_inactive_helper)
+                cv2.imshow(WINDOW_MAIN, display)
 
-            if show_mask_window:
-                cv2.imshow(WINDOW_MASK, result.mask)
+                key = cv2.waitKey(20) & 0xFF
+                action = handle_key(key, settings)
+                if action == "quit":
+                    break
+                if action == "toggle_pause":
+                    paused = not paused
+                    print("Paused." if paused else "Unpaused.")
+                elif key == ord("d"):
+                    save_debug_snapshot(frame, result, visualization, 0)
             else:
-                try:
-                    cv2.destroyWindow(WINDOW_MASK)
-                except cv2.error:
-                    pass
-
-            key = cv2.waitKey(20) & 0xFF
-            action = handle_key(key, settings)
-            if action == "quit":
+                print(build_helper_output(result, settings, turn_hint=turn_hint))
                 break
-            if action == "toggle_mask":
-                show_mask_window = not show_mask_window
-            elif action == "toggle_pause":
-                paused = not paused
-                print("Paused." if paused else "Unpaused.")
     finally:
         source.release()
-        cv2.destroyAllWindows()
+        if args.display:
+            cv2.destroyAllWindows()
 
     return 0
 

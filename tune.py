@@ -9,12 +9,12 @@ import main as detector
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Manual tuning tool for the QCar2 RGB drift helper.")
-    parser.add_argument("--source", choices=["video", "webcam", "realsense"], required=True)
+    parser.add_argument("--source", choices=["image", "video", "webcam", "realsense"], required=True)
+    parser.add_argument("--image", help="Path to an image file when --source image is used.")
     parser.add_argument("--video", help="Path to a video file when --source video is used.")
     parser.add_argument("--camera-index", type=int, default=0, help="OpenCV webcam index for --source webcam.")
     parser.add_argument("--config", default=detector.CONFIG_FILE, help="Camera config JSON to load and save.")
     parser.add_argument("--config-output", help="Optional alternate config path to save when pressing s.")
-    parser.add_argument("--session-output", default="configs/manual_tuning_session.json")
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--playback-speed", type=float, default=1.0)
     parser.add_argument("--show-inactive-helper", action="store_true", help="Draw faint inactive helper geometry for debugging.")
@@ -38,7 +38,8 @@ def tune_live_source(args):
     drift_state = {}
     use_ego_connected_mask = detector.cfg_bool(settings, "USE_EGO_CONNECTED_MASK", True)
     use_yellow_boundary_lock = detector.cfg_bool(settings, "USE_YELLOW_BOUNDARY_LOCK", True)
-    debug_folder = detector.create_manual_tuning_folders()["debug_snapshots"]
+    debug_folder = Path("outputs") / "debug_snapshots"
+    debug_folder.mkdir(parents=True, exist_ok=True)
     frame_index = 0
 
     print(f"Tuning config source: {config_source}")
@@ -76,7 +77,7 @@ def tune_live_source(args):
             turn_hint = detector.compute_turn_hint(result.curve_error_px, settings)
             detector.apply_drift_only_gate(result, turn_hint, drift_state, settings)
             show_inactive = args.show_inactive_helper or detector.cfg_bool(settings, "SHOW_INACTIVE_HELPER_DEFAULT", False)
-            debug_frame = detector.draw_visualization(frame, result, turn_hint, settings, show_inactive)
+            debug_frame = detector.draw_visualization(frame, result, turn_hint, settings, show_inactive, show_debug=True)
             display = detector.build_display_grid(frame, result, debug_frame, settings, show_inactive)
             cv2.imshow(detector.WINDOW_MAIN, display)
 
@@ -107,13 +108,129 @@ def tune_live_source(args):
         cv2.destroyAllWindows()
 
 
+def tune_video_source(args):
+    settings, config_source = detector.load_video_settings(args)
+    config_output_path = Path(args.config_output or args.config)
+    video_path = Path(args.video)
+    if not video_path.exists():
+        raise RuntimeError(f"Could not find video: {video_path}")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    current_frame_index = detector.seek_video_frame(cap, args.start_frame, total_frames)
+    playback_speed = max(0.1, args.playback_speed)
+
+    detector.create_trackbars(settings)
+    cv2.namedWindow(detector.WINDOW_MAIN, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(detector.WINDOW_VIDEO_CONTROL, cv2.WINDOW_NORMAL)
+    cv2.createTrackbar("Frame", detector.WINDOW_VIDEO_CONTROL, 0, max(1, total_frames - 1), detector.nothing)
+
+    paused = False
+    last_center_x = None
+    frames_since_valid = detector.LAST_CENTER_HOLD_FRAMES + 1
+    lane_side_memory = {}
+    safe_corridor_state = {}
+    drift_state = {}
+    use_ego_connected_mask = detector.cfg_bool(settings, "USE_EGO_CONNECTED_MASK", True)
+    use_yellow_boundary_lock = detector.cfg_bool(settings, "USE_YELLOW_BOUNDARY_LOCK", True)
+    debug_folder = Path("outputs") / "debug_snapshots"
+    debug_folder.mkdir(parents=True, exist_ok=True)
+
+    print(f"Tuning config source: {config_source}")
+    print("Controls: q/ESC quit | p/SPACE pause | n/b step | s save | d debug snapshot | y yellow lock | e ego mask")
+
+    try:
+        while True:
+            control_frame = cv2.getTrackbarPos("Frame", detector.WINDOW_VIDEO_CONTROL)
+            if total_frames > 0 and control_frame != current_frame_index:
+                current_frame_index = detector.seek_video_frame(cap, control_frame, total_frames)
+                last_center_x = None
+                frames_since_valid = detector.LAST_CENTER_HOLD_FRAMES + 1
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame_index)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+
+            frame = detector.resize_frame(frame)
+            settings = detector.get_trackbar_settings(settings)
+            result = detector.detect_road(
+                frame,
+                settings,
+                last_center_x,
+                frames_since_valid,
+                use_ego_connected_mask=use_ego_connected_mask,
+                detector_config=settings,
+                use_yellow_boundary_lock=use_yellow_boundary_lock,
+                lane_side_memory=lane_side_memory,
+                safe_corridor_state=safe_corridor_state,
+            )
+            if result.road_detected and result.road_center_x is not None:
+                last_center_x = result.road_center_x
+                frames_since_valid = 0
+            else:
+                frames_since_valid += 1
+
+            turn_hint = detector.compute_turn_hint(result.curve_error_px, settings)
+            detector.apply_drift_only_gate(result, turn_hint, drift_state, settings)
+            show_inactive = args.show_inactive_helper or detector.cfg_bool(settings, "SHOW_INACTIVE_HELPER_DEFAULT", False)
+            debug_frame = detector.draw_visualization(frame, result, turn_hint, settings, show_inactive, show_debug=True)
+            display = detector.build_display_grid(frame, result, debug_frame, settings, show_inactive)
+            cv2.putText(display, f"Frame {current_frame_index}/{max(0, total_frames - 1)}", (12, detector.FRAME_HEIGHT - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.imshow(detector.WINDOW_MAIN, display)
+            detector.update_video_control_trackbar(current_frame_index, total_frames)
+
+            delay_ms = 40 if paused else max(1, int(1000.0 / (fps * playback_speed)))
+            key = cv2.waitKeyEx(delay_ms)
+            if key in (ord("q"), 27):
+                break
+            if key in (ord("p"), 32):
+                paused = not paused
+            elif key == ord("s"):
+                detector.save_manual_tuning_config(config_output_path, settings, video_path, current_frame_index)
+            elif key == ord("d"):
+                prefix = debug_folder / f"frame_{current_frame_index:06d}"
+                cv2.imwrite(str(prefix) + "_original.jpg", frame)
+                cv2.imwrite(str(prefix) + "_mask.jpg", result.mask)
+                cv2.imwrite(str(prefix) + "_debug.jpg", debug_frame)
+                print(f"Saved debug snapshot {prefix}")
+            elif key == ord("y"):
+                use_yellow_boundary_lock = not use_yellow_boundary_lock
+                lane_side_memory.clear()
+            elif key == ord("e"):
+                use_ego_connected_mask = not use_ego_connected_mask
+            elif key in (ord("n"), 83, 2555904):
+                paused = True
+                current_frame_index = detector.seek_video_frame(cap, current_frame_index + 1, total_frames)
+            elif key in (ord("b"), 81, 2424832):
+                paused = True
+                current_frame_index = detector.seek_video_frame(cap, current_frame_index - 1, total_frames)
+
+            if not paused and key not in (ord("n"), ord("b"), 83, 81, 2555904, 2424832):
+                current_frame_index += 1
+                if total_frames > 0 and current_frame_index >= total_frames:
+                    current_frame_index = total_frames - 1
+                    paused = True
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
 def main():
     args = parse_args()
     if args.source == "video":
         if not args.video:
             print("ERROR: --video is required when --source video is used.")
             return 1
-        return detector.process_video_tuning_mode(args)
+        try:
+            tune_video_source(args)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}")
+            return 1
+        return 0
     try:
         tune_live_source(args)
     except RuntimeError as exc:
