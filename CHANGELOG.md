@@ -4,6 +4,47 @@
 
 Files changed:
 
+- `main.py`
+- `auto_tuner.py`
+- `scoring.py`
+- `README.md`
+- `requirements.txt`
+- `CHANGELOG.md`
+
+Summary:
+
+- Added offline auto-tuning with `--auto-tune`, `--seed-config`, `--quick`, `--max-configs`, `--top-k`, `--sample-stride`, `--full-eval-top-k`, `--random-seed`, and `--auto-tune-time-budget-hours`.
+- Added `auto_tuner.py` for candidate generation, sampled-frame evaluation, full-video evaluation of top configs, timestamped auto-tune output folders, best-config rendering, and human/AI summaries.
+- Added `scoring.py` with readable OpenCV/NumPy detector metrics and score math that balances detection rate, detection quality, scanlines, ego-component quality, mask area, and stability penalties.
+- Refactored detector calls so runtime candidate configs can override detector parameters such as center jump, smoothing, segment width, and ego-mask settings without editing `config.py`.
+- Updated README examples and workflow for Python 3.13.
+- Kept RealSense optional and removed `pyrealsense2` from required install dependencies because Python 3.13 wheels may not be available on every laptop.
+- Disabled candidate-path drawing in the final auto-tune render so best-config output focuses on the actual detected road centerline instead of demo branch visuals.
+
+What was removed as useless/dead code:
+
+- Removed `pyrealsense2` from `requirements.txt` as a hard dependency; the lazy optional import remains for live RealSense use.
+- No videos or generated output folders were added to version control; existing `.gitignore` already excludes local videos and generated outputs.
+
+Why:
+
+- Manual tuning gives a human baseline, but the detector now needs a repeatable optimizer that searches around that seed and scores balanced detector behavior instead of optimizing only road-detected percent.
+
+Known limitations:
+
+- This is still classical OpenCV/NumPy hyperparameter search, not ML training or reinforcement learning.
+- The first implementation is single-process for Windows simplicity; long searches can take time.
+- Candidate path confidence logic still exists for live/manual visualization, but auto-tuning scores the detected road mask and centerline directly.
+
+Follow-up work:
+
+- Split more of `main.py` into detector/video/output modules once the auto-tuning behavior stabilizes.
+- Add a tiny synthetic video fixture for automated tests.
+
+## 2026-05-22
+
+Files changed:
+
 - `config.py`
 - `main.py`
 - `README.md`

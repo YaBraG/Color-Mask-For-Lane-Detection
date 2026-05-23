@@ -1,3 +1,4 @@
 opencv-python
 numpy
-pyrealsense2
+# RealSense support is optional and imported lazily by main.py.
+# Install pyrealsense2 separately only if a Python 3.13 wheel is available.

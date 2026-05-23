@@ -12,11 +12,11 @@ For that reason this prototype detects the road surface itself, treats non-road 
 
 ## Install
 
-Use Python 3.12 on Windows. A virtual environment is not required.
+Use Python 3.13 on Windows. A virtual environment is not required.
 
 ```powershell
-py -3.12 -m pip install --upgrade pip
-py -3.12 -m pip install -r requirements.txt
+py -3.13 -m pip install --upgrade pip
+py -3.13 -m pip install -r requirements.txt
 ```
 
 `pyrealsense2` is listed in `requirements.txt` for RealSense support. If it is not installed, image and webcam modes still work.
@@ -26,19 +26,19 @@ py -3.12 -m pip install -r requirements.txt
 Static image tuning mode:
 
 ```powershell
-py -3.12 main.py --source image --image test.jpg
+py -3.13 main.py --source image --image test.jpg
 ```
 
 Webcam mode:
 
 ```powershell
-py -3.12 main.py --source webcam --camera-index 0
+py -3.13 main.py --source webcam --camera-index 0
 ```
 
 RealSense D435 RGB-only mode:
 
 ```powershell
-py -3.12 main.py --source realsense
+py -3.13 main.py --source realsense
 ```
 
 ## Video Processing Mode
@@ -48,31 +48,31 @@ Offline video processing runs a local video through the same RGB road-mask, cent
 Run the local test video:
 
 ```powershell
-py -3.12 main.py --source video --video assets/test_video.mp4
+py -3.13 main.py --source video --video assets/test_video.mp4
 ```
 
 Run without opening OpenCV display windows:
 
 ```powershell
-py -3.12 main.py --source video --video assets/test_video.mp4 --no-display
+py -3.13 main.py --source video --video assets/test_video.mp4 --no-display
 ```
 
 Run with the built-in defaults from `config.py`, ignoring any saved tuning:
 
 ```powershell
-py -3.12 main.py --source video --video assets/test_video.mp4 --use-default-config --no-display
+py -3.13 main.py --source video --video assets/test_video.mp4 --use-default-config --no-display
 ```
 
 Load a specific saved tuning file:
 
 ```powershell
-py -3.12 main.py --source video --video assets/test_video.mp4 --config path\to\road_config.json --no-display
+py -3.13 main.py --source video --video assets/test_video.mp4 --config path\to\road_config.json --no-display
 ```
 
 Choose the output folder:
 
 ```powershell
-py -3.12 main.py --source video --video assets/test_video.mp4 --output-dir outputs
+py -3.13 main.py --source video --video assets/test_video.mp4 --output-dir outputs
 ```
 
 By default, video mode loads `road_config.json` when that file exists. This lets a saved live tuning carry into offline analysis, but it also means `road_config.json` overrides the defaults in `config.py` unless `--use-default-config` is passed. The file `test_video_config_used.json` records the exact values and `config_source` used for each run.
@@ -122,7 +122,7 @@ Manual video tuning plays a recorded QCar2 ride with the same 2x2 display used b
 Run manual tuning:
 
 ```powershell
-py -3.12 main.py --source video --video assets/test_video.mp4 --tune-video
+py -3.13 main.py --source video --video assets/test_video.mp4 --tune-video
 ```
 
 Save the current tuning values by pressing `s`. By default, the config is saved to:
@@ -134,13 +134,13 @@ configs/manual_tuned_config.json
 You can choose a different output path:
 
 ```powershell
-py -3.12 main.py --source video --video assets/test_video.mp4 --tune-video --config-output configs/manual_tuned_config.json
+py -3.13 main.py --source video --video assets/test_video.mp4 --tune-video --config-output configs/manual_tuned_config.json
 ```
 
 Manual tuning starts from `DEFAULT_SETTINGS` unless `--config` is explicitly provided. To start from an existing saved config:
 
 ```powershell
-py -3.12 main.py --source video --video assets/test_video.mp4 --tune-video --config configs/manual_tuned_config.json
+py -3.13 main.py --source video --video assets/test_video.mp4 --tune-video --config configs/manual_tuned_config.json
 ```
 
 Useful keys:
@@ -170,6 +170,64 @@ outputs/manual_tuning/
 `g` and `f` save original, mask, and debug images. `d` saves original, mask, overlay, and debug images. The session file `configs/manual_tuning_session.json` records saved sample frame numbers and notes for future auto-tuning.
 
 This mode does not train anything, does not use machine learning, and does not control the QCar2. The future optimizer should use `configs/manual_tuned_config.json` as its starting point instead of searching randomly.
+
+## Auto-Tuning Workflow
+
+Auto-tuning is offline hyperparameter optimization for the OpenCV/NumPy detector. It does not train a model, does not use reinforcement learning, and does not control the QCar2. It tests many detector configurations around a seed config, scores each one on sampled video frames, fully evaluates the best few, then writes a final `best_config.json`.
+
+Recommended workflow:
+
+1. Run manual tuning:
+
+```powershell
+py -3.13 main.py --source video --video assets/test_video.mp4 --tune-video
+```
+
+2. Pause on difficult frames, adjust the trackbars, and press `s` to save `configs/manual_tuned_config.json`.
+
+3. Run auto-tuning from that seed:
+
+```powershell
+py -3.13 main.py --source video --video assets/test_video.mp4 --auto-tune --seed-config configs/manual_tuned_config.json --output-dir outputs --max-configs 500 --top-k 10 --full-eval-top-k 5
+```
+
+For a faster smoke test:
+
+```powershell
+py -3.13 main.py --source video --video assets/test_video.mp4 --auto-tune --seed-config configs/manual_tuned_config.json --quick --output-dir outputs
+```
+
+4. Use the winning config for a final analysis pass:
+
+```powershell
+py -3.13 main.py --source video --video assets/test_video.mp4 --config outputs/auto_tune_test_video_YYYYMMDD_HHMMSS/output_for_AI/best_config.json --no-display --output-dir outputs --save-failure-frames
+```
+
+Auto-tuning creates a timestamped folder:
+
+```text
+outputs/
+  auto_tune_test_video_YYYYMMDD_HHMMSS/
+    human_output/
+      best_config_annotated.mp4
+      auto_tune_summary.txt
+      best_config_summary.txt
+      comparison_frames/
+    output_for_AI/
+      auto_tune_scores.csv
+      top_configs.json
+      best_config.json
+      best_config_metrics.json
+      auto_tune_summary_ai.json
+      search_space.json
+      seed_config_used.json
+      best_run_telemetry.csv
+      best_run_events.csv
+      frame_samples/
+      failure_frames/
+```
+
+`best_config.json` contains metadata, the final score, and the winning detector config. `human_output` is for watching and skimming. `output_for_AI` is for detailed analysis, CSV review, and future tuning discussions. `outputs/latest_auto_tune_run.txt` points to the most recent auto-tune run.
 
 ## Controls
 

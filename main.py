@@ -275,6 +275,15 @@ def parse_args():
         action="store_true",
         help="Open an interactive manual tuning mode for --source video instead of full analysis.",
     )
+    parser.add_argument("--auto-tune", action="store_true", help="Run offline OpenCV/NumPy hyperparameter search.")
+    parser.add_argument("--seed-config", default="configs/manual_tuned_config.json", help="Config JSON used as the auto-tune search center.")
+    parser.add_argument("--quick", action="store_true", help="Use fewer candidates and wider frame stride for a fast auto-tune smoke test.")
+    parser.add_argument("--max-configs", type=int, default=500, help="Maximum candidate configs for sampled-frame auto-tuning.")
+    parser.add_argument("--top-k", type=int, default=10, help="Number of sampled-frame top configs to save.")
+    parser.add_argument("--sample-stride", type=int, default=10, help="Process every Nth frame during sampled auto-tune search.")
+    parser.add_argument("--full-eval-top-k", type=int, default=5, help="Number of top configs to evaluate on the full video.")
+    parser.add_argument("--random-seed", type=int, default=42, help="Random seed for reproducible candidate generation.")
+    parser.add_argument("--auto-tune-time-budget-hours", type=float, default=0.0, help="Optional wall-clock budget. 0 means use --max-configs.")
     parser.add_argument(
         "--use-default-config",
         action="store_true",
@@ -418,7 +427,23 @@ def clamp(value, minimum, maximum):
     return min(max(value, minimum), maximum)
 
 
-def detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_connected_mask=None):
+def cfg_value(detector_config, name, default):
+    # Auto-tuning passes candidate values in a runtime dict. Normal live/video
+    # modes leave detector_config as None and use config.py defaults.
+    if detector_config is not None and name in detector_config:
+        return detector_config[name]
+    return default
+
+
+def cfg_int(detector_config, name, default):
+    return int(round(float(cfg_value(detector_config, name, default))))
+
+
+def cfg_float(detector_config, name, default):
+    return float(cfg_value(detector_config, name, default))
+
+
+def detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_connected_mask=None, detector_config=None):
     height, width = frame.shape[:2]
     roi_top = int(height * settings["ROI_top_percent"] / 100.0)
 
@@ -442,12 +467,12 @@ def detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_conn
         full_mask = cv2.morphologyEx(full_mask, cv2.MORPH_CLOSE, close_kernel)
 
     raw_mask = full_mask.copy()
-    mask, ego_debug = keep_relevant_component(full_mask, settings, use_ego_connected_mask)
+    mask, ego_debug = keep_relevant_component(full_mask, settings, use_ego_connected_mask, detector_config)
     area = int(cv2.countNonZero(mask))
     roi_area = max(1, width * (height - roi_top))
     min_area = roi_area * settings["Min_area_percent"] / 100.0
     scan_points, boundary_points, rejected_scanlines, seed_center_x, first_anchor_x, first_anchor_distance_px = (
-        estimate_scanline_centers(mask, roi_top, last_center_x, frames_since_valid)
+        estimate_scanline_centers(mask, roi_top, last_center_x, frames_since_valid, detector_config)
     )
     tracked_center_valid = len(scan_points) >= 2
 
@@ -545,13 +570,13 @@ def make_ego_debug(mask, found=False, anchor_x=None, anchor_y=None, area_pixels=
     }
 
 
-def select_ego_connected_component(mask, settings):
+def select_ego_connected_component(mask, settings, detector_config=None):
     # HSV sees every road-colored pixel. This filter keeps only the white
     # component connected to the ego/start area near the bottom-center, where
     # the car's immediate drivable road should appear in the camera image.
     height, width = mask.shape[:2]
-    seed_x = int(round(width * EGO_SEED_X_RATIO))
-    seed_y = int(round(height * EGO_SEED_Y_RATIO))
+    seed_x = int(round(width * cfg_float(detector_config, "EGO_SEED_X_RATIO", EGO_SEED_X_RATIO)))
+    seed_y = int(round(height * cfg_float(detector_config, "EGO_SEED_Y_RATIO", EGO_SEED_Y_RATIO)))
     seed_x = min(max(0, seed_x), width - 1)
     seed_y = min(max(0, seed_y), height - 1)
 
@@ -559,7 +584,7 @@ def select_ego_connected_component(mask, settings):
     if mask[seed_y, seed_x] > 0:
         anchor = (seed_x, seed_y)
     else:
-        anchor = find_nearest_ego_anchor(mask, seed_x, seed_y)
+        anchor = find_nearest_ego_anchor(mask, seed_x, seed_y, detector_config)
 
     if anchor is None:
         return None, make_ego_debug(mask)
@@ -571,7 +596,7 @@ def select_ego_connected_component(mask, settings):
         return None, make_ego_debug(mask)
 
     area_pixels = int(stats[label, cv2.CC_STAT_AREA])
-    min_area = width * height * EGO_MIN_COMPONENT_AREA_PERCENT / 100.0
+    min_area = width * height * cfg_float(detector_config, "EGO_MIN_COMPONENT_AREA_PERCENT", EGO_MIN_COMPONENT_AREA_PERCENT) / 100.0
     if area_pixels < min_area:
         return None, make_ego_debug(mask)
 
@@ -580,9 +605,9 @@ def select_ego_connected_component(mask, settings):
     return selected, debug
 
 
-def find_nearest_ego_anchor(mask, seed_x, seed_y):
+def find_nearest_ego_anchor(mask, seed_x, seed_y, detector_config=None):
     height, width = mask.shape[:2]
-    radius = max(1, int(EGO_SEED_SEARCH_RADIUS_PX))
+    radius = max(1, cfg_int(detector_config, "EGO_SEED_SEARCH_RADIUS_PX", EGO_SEED_SEARCH_RADIUS_PX))
     x1 = max(0, seed_x - radius)
     x2 = min(width - 1, seed_x + radius)
     y1 = max(0, seed_y - radius)
@@ -592,7 +617,8 @@ def find_nearest_ego_anchor(mask, seed_x, seed_y):
     if points is None:
         return None
 
-    bottom_band_y = int(height * (1.0 - EGO_BOTTOM_BAND_PERCENT / 100.0))
+    bottom_band_percent = cfg_float(detector_config, "EGO_BOTTOM_BAND_PERCENT", EGO_BOTTOM_BAND_PERCENT)
+    bottom_band_y = int(height * (1.0 - bottom_band_percent / 100.0))
     best_score = None
     best_anchor = None
     for point in points.reshape(-1, 2):
@@ -614,12 +640,12 @@ def find_nearest_ego_anchor(mask, seed_x, seed_y):
     return best_anchor
 
 
-def keep_relevant_component(mask, settings, use_ego_connected_mask=None):
+def keep_relevant_component(mask, settings, use_ego_connected_mask=None, detector_config=None):
     if use_ego_connected_mask is None:
         use_ego_connected_mask = USE_EGO_CONNECTED_MASK
 
     if use_ego_connected_mask:
-        ego_mask, ego_debug = select_ego_connected_component(mask, settings)
+        ego_mask, ego_debug = select_ego_connected_component(mask, settings, detector_config)
         if ego_mask is not None:
             return ego_mask, ego_debug
     else:
@@ -672,9 +698,12 @@ def keep_relevant_component_by_score(mask, settings):
     return np.where(labels == best_label, 255, 0).astype(np.uint8)
 
 
-def estimate_scanline_centers(mask, roi_top, last_center_x=None, frames_since_valid=LAST_CENTER_HOLD_FRAMES + 1):
+def estimate_scanline_centers(mask, roi_top, last_center_x=None, frames_since_valid=LAST_CENTER_HOLD_FRAMES + 1, detector_config=None):
     height, width = mask.shape[:2]
     y_values = np.linspace(height - 35, max(roi_top + 10, int(height * 0.52)), SCANLINE_COUNT).astype(int)
+    min_segment_width_px = cfg_int(detector_config, "MIN_SEGMENT_WIDTH_PX", MIN_SEGMENT_WIDTH_PX)
+    max_center_jump_px = cfg_int(detector_config, "MAX_CENTER_JUMP_PX", MAX_CENTER_JUMP_PX)
+    allow_first_anchor_jump = bool(cfg_value(detector_config, "ALLOW_FIRST_ANCHOR_JUMP", ALLOW_FIRST_ANCHOR_JUMP))
 
     raw_points = []
     boundary_points = []
@@ -688,7 +717,7 @@ def estimate_scanline_centers(mask, roi_top, last_center_x=None, frames_since_va
     first_anchor_distance_px = None
 
     for y in y_values:
-        segments = find_road_segments(mask[y, :], MIN_SEGMENT_WIDTH_PX)
+        segments = find_road_segments(mask[y, :], min_segment_width_px)
         if not segments:
             rejected_scanlines += 1
             continue
@@ -704,7 +733,7 @@ def estimate_scanline_centers(mask, roi_top, last_center_x=None, frames_since_va
         if first_anchor_x is None:
             first_anchor_x = float(center_x)
             first_anchor_distance_px = float(abs(center_x - seed_center_x))
-            if not ALLOW_FIRST_ANCHOR_JUMP and abs(center_jump) > MAX_CENTER_JUMP_PX:
+            if not allow_first_anchor_jump and abs(center_jump) > max_center_jump_px:
                 rejected_scanlines += 1
                 first_anchor_x = None
                 first_anchor_distance_px = None
@@ -717,7 +746,7 @@ def estimate_scanline_centers(mask, roi_top, last_center_x=None, frames_since_va
 
         # Reject large jumps so the path does not snap across a wide
         # intersection to a different road branch in one scanline.
-        if abs(center_jump) > MAX_CENTER_JUMP_PX:
+        if abs(center_jump) > max_center_jump_px:
             rejected_scanlines += 1
             continue
 
@@ -726,7 +755,7 @@ def estimate_scanline_centers(mask, roi_top, last_center_x=None, frames_since_va
         boundary_points.append((right_x, int(y)))
         previous_center_x = center_x
 
-    scan_points = smooth_centerline_points(raw_points)
+    scan_points = smooth_centerline_points(raw_points, detector_config)
 
     # Preserve bottom-to-top order for drawing a path from the vehicle forward.
     return scan_points, boundary_points, rejected_scanlines, seed_center_x, first_anchor_x, first_anchor_distance_px
@@ -759,7 +788,7 @@ def add_segment_if_wide_enough(segments, left_x, right_x, min_width_px):
     segments.append((int(left_x), int(right_x), float(center_x)))
 
 
-def smooth_centerline_points(raw_points):
+def smooth_centerline_points(raw_points, detector_config=None):
     if not raw_points:
         return []
 
@@ -769,10 +798,8 @@ def smooth_centerline_points(raw_points):
     for center_x, left_x, right_x, y in raw_points:
         # Exponential smoothing keeps the centerline from twitching when mask
         # edges are noisy, while still allowing gradual curves to show up.
-        smoothed_center_x = (
-            (1.0 - CENTERLINE_SMOOTHING_ALPHA) * smoothed_center_x
-            + CENTERLINE_SMOOTHING_ALPHA * center_x
-        )
+        alpha = cfg_float(detector_config, "CENTERLINE_SMOOTHING_ALPHA", CENTERLINE_SMOOTHING_ALPHA)
+        smoothed_center_x = ((1.0 - alpha) * smoothed_center_x + alpha * center_x)
         smoothed_points.append((int(round(smoothed_center_x)), left_x, right_x, y))
 
     return smoothed_points
@@ -1029,11 +1056,15 @@ def create_output_folders(output_dir, base_name, clean_output=False):
 def load_settings_file(path):
     with open(path, "r", encoding="utf-8") as file:
         loaded = json.load(file)
+    if "config" in loaded and isinstance(loaded["config"], dict):
+        loaded = loaded["config"]
 
     settings = DEFAULT_SETTINGS.copy()
-    for name in settings:
-        if name in loaded:
-            settings[name] = int(loaded[name])
+    for name, value in loaded.items():
+        if isinstance(value, (int, float)):
+            settings[name] = value
+    for name in DEFAULT_SETTINGS:
+        settings[name] = int(settings[name])
     return settings
 
 
@@ -1673,7 +1704,7 @@ def process_video_tuning_mode(args):
 
             frame = resize_frame(frame)
             settings = get_trackbar_settings()
-            result = detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_connected_mask)
+            result = detect_road(frame, settings, last_center_x, frames_since_valid, use_ego_connected_mask, settings)
             if result.road_detected and result.road_center_x is not None:
                 last_center_x = result.road_center_x
                 frames_since_valid = 0
@@ -1941,7 +1972,7 @@ def process_video_source(args):
                 elapsed = max(0.001, time.perf_counter() - run_start_time)
                 processing_fps = processed_frames / elapsed
 
-                result = detect_road(frame, settings, last_center_x, frames_since_valid)
+                result = detect_road(frame, settings, last_center_x, frames_since_valid, detector_config=settings)
 
                 if result.road_detected and result.road_center_x is not None:
                     last_center_x = result.road_center_x
@@ -2110,6 +2141,11 @@ def main():
 
     if args.source == "video":
         try:
+            if args.auto_tune:
+                from auto_tuner import run_auto_tune
+
+                run_auto_tune(args)
+                return 0
             if args.tune_video:
                 return process_video_tuning_mode(args)
             return process_video_source(args)
